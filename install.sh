@@ -30,8 +30,8 @@ region=${region:-eastus}
 [[ "$region" =~ ^[a-z0-9]+$ ]] || { echo "Region must look like eastus or uksouth."; exit 1; }
 
 consent=()
-echo "AIO reads users, devices, licences, Conditional Access, Intune, Defender incidents and Microsoft 365"
-echo "health through Microsoft Graph, with 10 read-only permissions. It cannot change anything."
+echo "AIO reads users, groups, devices, sign-ins, roles, apps, Intune, Defender, Secure Score, SharePoint"
+echo "sites and Microsoft 365 health through Microsoft Graph, with 22 read-only permissions. It cannot change anything."
 read -rp "Grant admin consent for that now? Needs Global Administrator or Privileged Role Administrator. [Y/n] " answer
 [[ "$answer" =~ ^[Nn]$ ]] || consent=(--grant-consent)
 

@@ -14,4 +14,16 @@ READ_PERMISSIONS = (
     "Organization.Read.All",                    # Microsoft 365 organisation
     "Domain.Read.All",                          # Microsoft 365 domains
     "ServiceHealth.Read.All",                   # Microsoft 365 service health
+    "Group.Read.All",                           # Groups, Teams
+    "AuditLog.Read.All",                        # Sign-ins, Audit log, MFA, Inactive users
+    "IdentityRiskyUser.Read.All",               # Risky users
+    "IdentityRiskEvent.Read.All",               # Risk detections
+    "RoleManagement.Read.Directory",            # Roles
+    "Application.Read.All",                     # Applications, Consented apps
+    "SecurityEvents.Read.All",                  # Secure Score
+    "SecurityAlert.Read.All",                   # Defender alerts
+    "ConsentRequest.Read.All",                  # App consent requests
+    "DeviceManagementConfiguration.Read.All",   # Intune configuration/compliance policies, scripts
+    "DeviceManagementServiceConfig.Read.All",   # Autopilot
+    "Sites.Read.All",                           # SharePoint sites
 )

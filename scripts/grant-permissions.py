@@ -35,10 +35,31 @@ CHECKS = (
     ("Organisation", "Organization.Read.All", "/v1.0/organization?$select=id"),
     ("Domains", "Domain.Read.All", "/v1.0/domains?$select=id"),
     ("Service health", "ServiceHealth.Read.All", "/v1.0/admin/serviceAnnouncement/healthOverviews?$select=id"),
+    ("Groups", "Group.Read.All", "/v1.0/groups?$select=id&$top=1"),
+    # Directory audits work on every tenant, so a free tenant passes; sign-in logs also need Entra ID P1.
+    ("Audit log", "AuditLog.Read.All", "/v1.0/auditLogs/directoryAudits?$top=1"),
+    ("Risky users", "IdentityRiskyUser.Read.All", "/v1.0/identityProtection/riskyUsers?$top=1"),
+    ("Risk detections", "IdentityRiskEvent.Read.All", "/v1.0/identityProtection/riskDetections?$top=1"),
+    ("Roles", "RoleManagement.Read.Directory", "/v1.0/directoryRoles"),
+    ("Applications", "Application.Read.All", "/v1.0/applications?$select=id&$top=1"),
+    ("Secure Score", "SecurityEvents.Read.All", "/v1.0/security/secureScores?$top=1"),
+    ("Defender alerts", "SecurityAlert.Read.All", "/v1.0/security/alerts_v2?$top=1"),
+    ("App consent requests", "ConsentRequest.Read.All",
+     "/v1.0/identityGovernance/appConsent/appConsentRequests?$top=1"),
+    ("Intune policies", "DeviceManagementConfiguration.Read.All",
+     "/v1.0/deviceManagement/deviceConfigurations?$select=id&$top=1"),
+    ("Autopilot", "DeviceManagementServiceConfig.Read.All",
+     "/v1.0/deviceManagement/windowsAutopilotDeviceIdentities?$top=1"),
+    ("SharePoint sites", "Sites.Read.All", "/v1.0/sites/root?$select=id"),
 )
 # Areas that also need a product licence in the tenant, not just consent.
 LICENSED = {"DeviceManagementManagedDevices.Read.All": "Intune", "DeviceManagementApps.Read.All": "Intune",
-            "SecurityIncident.Read.All": "Microsoft Defender XDR"}
+            "DeviceManagementConfiguration.Read.All": "Intune", "DeviceManagementServiceConfig.Read.All": "Intune",
+            "SecurityIncident.Read.All": "Microsoft Defender XDR", "SecurityAlert.Read.All": "Microsoft Defender XDR",
+            "IdentityRiskyUser.Read.All": "Microsoft Entra ID P2",
+            "IdentityRiskEvent.Read.All": "Microsoft Entra ID P2", "Sites.Read.All": "SharePoint Online"}
+# Areas whose check passes on any tenant but where part of the AIO area needs a licence.
+PARTLY_LICENSED = {"AuditLog.Read.All": "sign-in logs (Sign-ins, MFA, Inactive users) also need Microsoft Entra ID P1"}
 WAIT_SECONDS = 300  # new consent usually reaches app tokens within a few minutes
 
 
@@ -105,7 +126,7 @@ def run_checks(settings, wait):
 
 def explain(permission, status, code):
     if status == 200:
-        return "live"
+        return "live; " + PARTLY_LICENSED[permission] if permission in PARTLY_LICENSED else "live"
     if status in (401, 403) and permission in LICENSED:
         return (f"denied ({status}). Consent can take a few minutes; if it stays denied the tenant may not "
                 f"have {LICENSED[permission]}, so AIO shows this area as unavailable.")
