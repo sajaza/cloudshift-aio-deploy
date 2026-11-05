@@ -30,7 +30,9 @@ DEFAULT_ENV = ROOT / ".env.entra.generated"
 PROVIDERS = ("Microsoft.App", "Microsoft.OperationalInsights", "Microsoft.ContainerRegistry",
              "Microsoft.KeyVault", "Microsoft.ManagedIdentity")
 REQUIRED = ("NEXTAUTH_SECRET", "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "ENTRA_CLIENT_SECRET",
-            "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "CLOUDSHIFT_OPERATOR_IDS")
+            "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET")
+# At least one is required: listed operator object IDs, or an Entra group whose members are operators.
+OPERATOR_IDS, OPERATOR_GROUP = "CLOUDSHIFT_OPERATOR_IDS", "CLOUDSHIFT_OPERATOR_GROUP_ID"
 # Key Vault secret name -> environment variable. Must match secretNames in main.bicep.
 SECRETS = {"nextauth-secret": "NEXTAUTH_SECRET", "entra-client-secret": "ENTRA_CLIENT_SECRET",
            "graph-client-secret": "GRAPH_CLIENT_SECRET"}
@@ -91,8 +93,17 @@ def load_settings(path, check_user_admin=True):
         raise SetupError("NEXTAUTH_SECRET must contain at least 32 characters.")
     for key in ("ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "GRAPH_CLIENT_ID"):
         values[key] = identifier(values[key])
-    values["CLOUDSHIFT_OPERATOR_IDS"] = ",".join(
-        identifier(v.strip()) for v in values["CLOUDSHIFT_OPERATOR_IDS"].split(",") if v.strip())
+    values[OPERATOR_IDS] = ",".join(
+        identifier(v.strip()) for v in values.get(OPERATOR_IDS, "").split(",") if v.strip())
+    if values.get(OPERATOR_GROUP):
+        try:
+            values[OPERATOR_GROUP] = identifier(values[OPERATOR_GROUP])
+        except SetupError:
+            raise SetupError(OPERATOR_GROUP + " must be the group's object ID (a UUID), not its name.") from None
+    else:
+        values[OPERATOR_GROUP] = ""
+    if not values[OPERATOR_IDS] and not values[OPERATOR_GROUP]:
+        raise SetupError("Missing configuration: " + OPERATOR_IDS + " or " + OPERATOR_GROUP)
     try:
         tenants = json.loads(values.get("CLOUDSHIFT_TENANTS_JSON") or "[]")
     except json.JSONDecodeError:
@@ -134,7 +145,8 @@ def template_parameters(settings, name, deployer_id, image="", domain=None, cert
         "customDomain": domain or "", "customDomainCertificateId": certificate_id or "",
         "name": name, "deployerObjectId": deployer_id, "deployApp": bool(image), "image": image,
         "entraTenantId": settings["ENTRA_TENANT_ID"], "entraClientId": settings["ENTRA_CLIENT_ID"],
-        "graphClientId": settings["GRAPH_CLIENT_ID"], "operatorIds": settings["CLOUDSHIFT_OPERATOR_IDS"],
+        "graphClientId": settings["GRAPH_CLIENT_ID"], "operatorIds": settings[OPERATOR_IDS],
+        "operatorGroupId": settings.get(OPERATOR_GROUP, ""),
         "tenantsJson": settings["CLOUDSHIFT_TENANTS_JSON"],
         # Only the write app's client ID; its secret is a Key Vault reference like the others.
         "enableUserAdmin": user_admin_enabled(settings),
@@ -508,6 +520,7 @@ def plan(args):
     print("Add https://<app address>" + CALLBACK + " to cloudshift operators; keep existing redirects.")
     print(f"Add any of the {len(READ_PERMISSIONS)} read-only Graph permissions cloudshift inventory is missing; never remove any.")
     print("With --grant-consent, admin-consent exactly those permissions before the app starts.")
+    print("If the configuration has " + OPERATOR_GROUP + ", members of that Entra group may also sign in.")
     print("Customer onboarding stays manual.")
 
 
@@ -619,6 +632,9 @@ def main():
         print("  Or rerun this command with --grant-consent as a Global or Privileged Role Administrator.")
     if user_admin_enabled(settings):
         print("User creation is on, using the separate 'cloudshift user admin' registration.")
+    if settings[OPERATOR_GROUP]:
+        print("Members of the Entra group " + settings[OPERATOR_GROUP] + " may sign in, as well as any listed")
+        print("  operator IDs. Removing someone from the group takes effect within about 10 minutes.")
     print("Sign in at the address above with an approved operator account.")
     print("The first start can take a minute. Rerun this script to ship a new build.")
 

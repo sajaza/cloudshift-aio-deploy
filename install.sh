@@ -30,10 +30,20 @@ region=${region:-eastus}
 [[ "$region" =~ ^[a-z0-9]+$ ]] || { echo "Region must look like eastus or uksouth."; exit 1; }
 
 consent=()
-echo "AIO reads users, groups, devices, sign-ins, roles, apps, Intune, Defender, Secure Score, SharePoint"
-echo "sites and Microsoft 365 health through Microsoft Graph, with 22 read-only permissions. It cannot change anything."
+echo "AIO reads users, groups, devices, sign-ins, roles, apps, Intune, Defender, Secure Score, SharePoint,"
+echo "usage reports and Microsoft 365 health through Microsoft Graph, with 23 read-only permissions. It cannot change anything."
 read -rp "Grant admin consent for that now? Needs Global Administrator or Privileged Role Administrator. [Y/n] " answer
 [[ "$answer" =~ ^[Nn]$ ]] || consent=(--grant-consent)
+
+group=""
+echo "Optional: let everyone in an Entra security group sign in, as well as you."
+read -rp "Entra group whose members may use AIO (name or object ID, Enter to skip): " group_answer
+if [[ -n "$group_answer" ]]; then
+  group=$(az ad group show --group "$group_answer" --query id -o tsv --only-show-errors 2>/dev/null || true)
+  [[ "$group" =~ ^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$ ]] || {
+    echo "No single Entra group matches that name or ID. Nothing was changed."; exit 1; }
+  echo "  Using group $group. Members (including nested groups) may sign in."
+fi
 
 echo
 echo "Step A: app registrations"
@@ -41,6 +51,9 @@ if [[ -f .env.entra.generated ]]; then
   echo "  Reusing the registrations created by an earlier run."
 else
   python3 scripts/register-entra.py --tenant-id "$tenant" --tenant-name "$company" --for-hosting
+fi
+if [[ -n "$group" ]]; then
+  python3 scripts/register-entra.py --set-operator-group "$group" --env-file .env.entra.generated
 fi
 
 echo

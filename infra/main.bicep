@@ -29,6 +29,9 @@ param graphClientId string = ''
 @description('Comma-separated approved operator object IDs.')
 param operatorIds string = ''
 
+@description('Optional Entra security group object ID; its direct and nested members may also sign in.')
+param operatorGroupId string = ''
+
 @description('JSON allowlist of approved customer tenants.')
 param tenantsJson string = '[]'
 
@@ -60,6 +63,8 @@ var userAdminEnv = enableUserAdmin
       { name: 'USERADMIN_CLIENT_SECRET', secretRef: 'useradmin-client-secret' }
     ]
   : []
+// Set only when a group is configured.
+var operatorGroupEnv = empty(operatorGroupId) ? [] : [{ name: 'CLOUDSHIFT_OPERATOR_GROUP_ID', value: operatorGroupId }]
 
 resource logs 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
   name: '${name}-logs-${suffix}'
@@ -196,7 +201,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
             { name: 'GRAPH_CLIENT_SECRET', secretRef: 'graph-client-secret' }
             { name: 'CLOUDSHIFT_OPERATOR_IDS', value: operatorIds }
             { name: 'CLOUDSHIFT_TENANTS_JSON', value: tenantsJson }
-          ], userAdminEnv)
+          ], operatorGroupEnv, userAdminEnv)
           probes: [
             {
               type: 'Startup'

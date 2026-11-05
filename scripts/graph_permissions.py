@@ -26,4 +26,6 @@ READ_PERMISSIONS = (
     "DeviceManagementConfiguration.Read.All",   # Intune configuration/compliance policies, scripts
     "DeviceManagementServiceConfig.Read.All",   # Autopilot
     "Sites.Read.All",                           # SharePoint sites
+    "Reports.Read.All",                         # Usage reports: OneDrive, Mailbox Activity/Statistics, Teams
+                                                # Activity, Group Usage, Graph/Office Reports, Copilot reports
 )

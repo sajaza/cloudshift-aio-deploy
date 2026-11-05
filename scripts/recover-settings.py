@@ -19,7 +19,7 @@ SetupError, cli = deployment.SetupError, deployment.cli
 
 # Plain settings copied from the Container App, in the order register-entra.py writes them.
 PLAIN = ("NEXTAUTH_URL", "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "GRAPH_CLIENT_ID", "CLOUDSHIFT_OPERATOR_IDS",
-         "CLOUDSHIFT_TENANTS_JSON", deployment.USER_ADMIN_FLAG, "USERADMIN_CLIENT_ID")
+         "CLOUDSHIFT_TENANTS_JSON", deployment.OPERATOR_GROUP, deployment.USER_ADMIN_FLAG, "USERADMIN_CLIENT_ID")
 
 
 def quote(value):

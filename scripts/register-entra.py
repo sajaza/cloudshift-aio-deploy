@@ -9,6 +9,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
@@ -23,6 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 GRAPH = "https://graph.microsoft.com/v1.0"
 STATE_PATH = ROOT / ".env.registration-state.json"
 OUTPUT_PATH = ROOT / ".env.entra.generated"
+# Optional Entra security group whose direct and nested members may sign in to AIO.
+OPERATOR_GROUP = "CLOUDSHIFT_OPERATOR_GROUP_ID"
 
 
 class SetupError(Exception):
@@ -174,13 +177,52 @@ def provision_app(key, manifest, state):
     print(manifest["displayName"] + ": ready (client ID " + record["client_id"] + ")")
 
 
-def environment(state, tenant_name):
+def quote(value):
     # Escape dollar signs because Next.js expands dotenv values after quote parsing.
-    def quote(value):
-        text = str(value)
-        if any(char in text for char in ("'", "\n", "\r")):
-            raise SetupError("Unexpected environment-value characters; generated secrets were not printed.")
-        return "'" + text.replace("$", "\\$") + "'"
+    text = str(value)
+    if any(char in text for char in ("'", "\n", "\r")):
+        raise SetupError("Unexpected environment-value characters; generated secrets were not printed.")
+    return "'" + text.replace("$", "\\$") + "'"
+
+
+ENV_KEY = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$")
+
+
+def read_private_env(path):
+    """Lines of an existing private configuration file; refuses links and readable-by-others files."""
+    if path.is_symlink() or not path.is_file():
+        raise SetupError(f"{path.name} not found. Run the full setup first.")
+    if os.name != "nt" and path.stat().st_mode & 0o077:
+        raise SetupError(f"Configuration file must be private: run chmod 600 {path.name}.")
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def env_value(lines, key):
+    for line in lines:
+        match = ENV_KEY.match(line)
+        if match and match.group(1) == key:
+            value = match.group(2)
+            return value[1:-1] if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"" else value
+    return ""
+
+
+def set_env_value(path, key, value):
+    """Replace or append one KEY='value' line; every other line is kept. Atomic, mode 0600."""
+    lines, found = [], False
+    for line in read_private_env(path):
+        match = ENV_KEY.match(line)
+        if match and match.group(1) == key:
+            if not found:
+                lines.append(key + "=" + quote(value))
+            found = True
+        else:
+            lines.append(line)
+    if not found:
+        lines.append(key + "=" + quote(value))
+    private_write(path, "\n".join(lines) + "\n")
+
+
+def environment(state, tenant_name, operator_group=""):
     a, b = state["apps"]["operators"], state["apps"]["inventory"]
     values = {
         "CLOUDSHIFT_DEMO_MODE": "false", "NEXTAUTH_URL": "http://localhost:3000",
@@ -191,6 +233,8 @@ def environment(state, tenant_name):
         "CLOUDSHIFT_TENANTS_JSON": json.dumps([{"id": state["tenant_id"], "name": tenant_name}]),
         "CLOUDSHIFT_GDAP_DISCOVERY": "false", "CLOUDSHIFT_PARTNER_DISCOVERY": "false",
     }
+    if operator_group:
+        values[OPERATOR_GROUP] = identifier(operator_group)
     return "# Private generated local configuration. Never commit or share.\n" + "\n".join(k + "=" + quote(v) for k, v in values.items()) + "\n"
 
 
@@ -200,18 +244,34 @@ def main():
     parser.add_argument("--tenant-name", default="cloudshift", help="Local selector display name")
     parser.add_argument("--for-hosting", action="store_true", help="Called by install.sh; skip local next steps")
     parser.add_argument("--plan", action="store_true", help="Show changes without logging in or changing Azure")
+    parser.add_argument("--operator-group", metavar="GROUP_ID",
+                        help="Entra group object ID whose direct and nested members may also sign in")
+    parser.add_argument("--set-operator-group", metavar="GROUP_ID",
+                        help="Only save this operator group ID in an existing configuration file; no Azure changes")
+    parser.add_argument("--env-file", type=Path, default=OUTPUT_PATH,
+                        help="Configuration file for --set-operator-group (default .env.entra.generated)")
     args = parser.parse_args()
+    if args.set_operator_group is not None:
+        try:
+            group = identifier(args.set_operator_group.strip())
+        except SetupError:
+            raise SetupError("The operator group must be the group's object ID (a UUID).") from None
+        set_env_value(args.env_file, OPERATOR_GROUP, group)
+        print(f"Operator group {group} saved to {args.env_file.name}; redeploy to apply it.")
+        return
     if args.plan:
         print("Create cloudshift operators: single-tenant OIDC web app, localhost redirect, no Graph permissions.")
         print("Create cloudshift inventory: multitenant app, read-only Graph application permissions:")
         for permission in PERMISSIONS:
             print("  " + permission)
         print("Create enterprise apps and 180-day client secrets; approve only the signed-in operator locally.")
+        print("With --operator-group, also let members of that Entra group sign in (saved as " + OPERATOR_GROUP + ").")
         print("Store credentials in ignored mode-0600 files; preserve .env.local. Admin consent remains a portal step.")
         return
     if not args.tenant_id:
         raise SetupError("Pass --tenant-id with your Entra tenant UUID, or use --plan.")
     tenant_id = identifier(args.tenant_id)
+    operator_group = identifier(args.operator_group.strip()) if args.operator_group else ""
     if not shutil.which("az"):
         raise SetupError("Install Microsoft's Azure CLI, then sign in with az login --tenant TENANT_ID --allow-no-subscriptions.")
     if cli(["cloud", "show"]).get("name") != "AzureCloud":
@@ -232,7 +292,10 @@ def main():
     for key, definition in definitions.items():
         print("Preparing " + definition["displayName"] + "…")
         provision_app(key, definition, state)
-    private_write(OUTPUT_PATH, environment(state, args.tenant_name))
+    if not operator_group and OUTPUT_PATH.is_file() and not OUTPUT_PATH.is_symlink():
+        # Keep an operator group saved by an earlier run or by --set-operator-group.
+        operator_group = env_value(read_private_env(OUTPUT_PATH), OPERATOR_GROUP)
+    private_write(OUTPUT_PATH, environment(state, args.tenant_name, operator_group))
     if args.for_hosting:
         print("App registrations ready; private configuration saved for the hosting step.")
         return

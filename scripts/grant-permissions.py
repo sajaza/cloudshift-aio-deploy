@@ -51,6 +51,8 @@ CHECKS = (
     ("Autopilot", "DeviceManagementServiceConfig.Read.All",
      "/v1.0/deviceManagement/windowsAutopilotDeviceIdentities?$top=1"),
     ("SharePoint sites", "Sites.Read.All", "/v1.0/sites/root?$select=id"),
+    # Answers 302 to a short-lived CSV download; the redirect is not followed (see graph_status).
+    ("Usage reports", "Reports.Read.All", "/v1.0/reports/getOffice365ActivationsUserCounts"),
 )
 # Areas that also need a product licence in the tenant, not just consent.
 LICENSED = {"DeviceManagementManagedDevices.Read.All": "Intune", "DeviceManagementApps.Read.All": "Intune",
@@ -59,7 +61,8 @@ LICENSED = {"DeviceManagementManagedDevices.Read.All": "Intune", "DeviceManageme
             "IdentityRiskyUser.Read.All": "Microsoft Entra ID P2",
             "IdentityRiskEvent.Read.All": "Microsoft Entra ID P2", "Sites.Read.All": "SharePoint Online"}
 # Areas whose check passes on any tenant but where part of the AIO area needs a licence.
-PARTLY_LICENSED = {"AuditLog.Read.All": "sign-in logs (Sign-ins, MFA, Inactive users) also need Microsoft Entra ID P1"}
+PARTLY_LICENSED = {"AuditLog.Read.All": "sign-in logs (Sign-ins, MFA, Inactive users) also need Microsoft Entra ID P1",
+                   "Reports.Read.All": "Copilot usage reports also need Microsoft 365 Copilot licences"}
 WAIT_SECONDS = 300  # new consent usually reaches app tokens within a few minutes
 
 
@@ -93,14 +96,32 @@ def app_token(settings):
     return token
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: a usage report's 302 points at a download host that must not get the token."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# Opener without automatic redirects; a 3xx surfaces as HTTPError and is never followed.
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
 def graph_status(path, token):
-    """(HTTP status, Graph error code) for one request. Response bodies are never printed."""
+    """(HTTP status, Graph error code) for one request. Response bodies are never printed.
+
+    A 302/303 from Graph means it authorised the report and issued a download link, so it counts as 200;
+    the link (on a reports host) is not fetched.
+    """
     request = urllib.request.Request("https://graph.microsoft.com" + path,
                                      headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with OPENER.open(request, timeout=30) as response:
             return response.status, ""
     except urllib.error.HTTPError as error:
+        if error.code in (302, 303):
+            error.close()
+            return 200, ""
         try:
             code = json.load(error).get("error", {}).get("code", "")
         except (ValueError, AttributeError):
