@@ -30,6 +30,10 @@ region=${region:-eastus}
 [[ "$region" =~ ^[a-z0-9]+$ ]] || { echo "Region must look like eastus or uksouth."; exit 1; }
 
 consent=()
+# Opt-in: CLOUDSHIFT_FEDERATION=true bash install.sh hosts AIO without an inventory client secret
+# (workload identity federation). An install that already uses it keeps it on every rerun.
+federation=()
+[[ "${CLOUDSHIFT_FEDERATION:-false}" == "true" ]] && federation=(--federation)
 echo "AIO reads users, groups, devices, sign-ins, roles, apps, Intune, Defender, Secure Score, SharePoint,"
 echo "usage reports and Microsoft 365 health through Microsoft Graph, with 23 read-only permissions. It cannot change anything."
 read -rp "Grant admin consent for that now? Needs Global Administrator or Privileged Role Administrator. [Y/n] " answer
@@ -58,4 +62,5 @@ fi
 
 echo
 echo "Step B: hosting (you will be asked for the image pull token you were given)"
-python3 scripts/deploy-azure.py --env-file .env.entra.generated --image "$IMAGE" --location "$region" "${consent[@]}"
+python3 scripts/deploy-azure.py --env-file .env.entra.generated --image "$IMAGE" --location "$region" \
+  "${consent[@]}" "${federation[@]}"

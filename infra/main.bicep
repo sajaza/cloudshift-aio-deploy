@@ -41,11 +41,11 @@ param customDomain string = ''
 @description('Resource ID of the managed certificate for customDomain. Both must be set to use the domain.')
 param customDomainCertificateId string = ''
 
-@description('Optional user creation through the separate cloudshift user admin app (User.ReadWrite.All only). Its secret must already be in Key Vault as useradmin-client-secret.')
+@description('Optional Add user feature. Writes run as the signed-in operator with a delegated Microsoft Graph token, limited to their own Entra role, so no write app or secret is deployed.')
 param enableUserAdmin bool = false
 
-@description('Client ID of the cloudshift user admin app registration. Used only when enableUserAdmin is true.')
-param userAdminClientId string = ''
+@description('No inventory client secret: the inventory app trusts the managed identity of this Container App through workload identity federation. Off keeps the client secret.')
+param useFederation bool = false
 
 var suffix = uniqueString(resourceGroup().id)
 var roles = {
@@ -53,16 +53,16 @@ var roles = {
   keyVaultSecretsUser: '4633458b-17de-408a-b874-0445c86b69e6'
   keyVaultSecretsOfficer: 'b86a8fe4-44ce-4948-aee5-eccb2c155cd7'
 }
-var baseSecretNames = ['nextauth-secret', 'entra-client-secret', 'graph-client-secret']
-// Referenced only when user creation is on, so a disabled deploy never points at a missing secret.
-var secretNames = enableUserAdmin ? concat(baseSecretNames, ['useradmin-client-secret']) : baseSecretNames
-var userAdminEnv = enableUserAdmin
-  ? [
-      { name: 'CLOUDSHIFT_ENABLE_USER_ADMIN', value: 'true' }
-      { name: 'USERADMIN_CLIENT_ID', value: userAdminClientId }
-      { name: 'USERADMIN_CLIENT_SECRET', secretRef: 'useradmin-client-secret' }
-    ]
-  : []
+// With federation the inventory app has no secret, so graph-client-secret is not referenced at all.
+var secretNames = useFederation
+  ? ['nextauth-secret', 'entra-client-secret']
+  : ['nextauth-secret', 'entra-client-secret', 'graph-client-secret']
+// Add user needs only its flag: there is no separate write app, client ID or secret.
+var userAdminEnv = enableUserAdmin ? [{ name: 'CLOUDSHIFT_ENABLE_USER_ADMIN', value: 'true' }] : []
+// Inventory credential: the identity's client ID for federation, otherwise the Key Vault secret.
+var graphCredentialEnv = useFederation
+  ? [{ name: 'CLOUDSHIFT_FEDERATED_IDENTITY_CLIENT_ID', value: identity.properties.clientId }]
+  : [{ name: 'GRAPH_CLIENT_SECRET', secretRef: 'graph-client-secret' }]
 // Set only when a group is configured.
 var operatorGroupEnv = empty(operatorGroupId) ? [] : [{ name: 'CLOUDSHIFT_OPERATOR_GROUP_ID', value: operatorGroupId }]
 
@@ -198,7 +198,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
             { name: 'ENTRA_CLIENT_ID', value: entraClientId }
             { name: 'ENTRA_CLIENT_SECRET', secretRef: 'entra-client-secret' }
             { name: 'GRAPH_CLIENT_ID', value: graphClientId }
-            { name: 'GRAPH_CLIENT_SECRET', secretRef: 'graph-client-secret' }
+          ], graphCredentialEnv, [
             { name: 'CLOUDSHIFT_OPERATOR_IDS', value: operatorIds }
             { name: 'CLOUDSHIFT_TENANTS_JSON', value: tenantsJson }
           ], operatorGroupEnv, userAdminEnv)
@@ -235,3 +235,7 @@ output environmentName string = appEnvironment.name
 output registryName string = registry.name
 output registryServer string = registry.properties.loginServer
 output vaultName string = vault.name
+// Federated identity credentials use the principal (object) ID as subject; the app selects the
+// identity by its client ID.
+output identityClientId string = identity.properties.clientId
+output identityPrincipalId string = identity.properties.principalId

@@ -3,7 +3,9 @@
 
 Use it when .env.entra.generated was lost, for example when Cloud Shell was reset, so that install.sh
 and deploy-azure.py can update the install again. Reads app IDs and settings from the Container App
-and the three secrets from its Key Vault. Never prints credential values. Python standard library only.
+and the three secrets from its Key Vault (two for an install using workload identity federation, which
+has no graph-client-secret; the file then says CLOUDSHIFT_USE_FEDERATION='true').
+Never prints credential values. Python standard library only.
 """
 import argparse
 import importlib.util
@@ -19,7 +21,7 @@ SetupError, cli = deployment.SetupError, deployment.cli
 
 # Plain settings copied from the Container App, in the order register-entra.py writes them.
 PLAIN = ("NEXTAUTH_URL", "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "GRAPH_CLIENT_ID", "CLOUDSHIFT_OPERATOR_IDS",
-         "CLOUDSHIFT_TENANTS_JSON", deployment.OPERATOR_GROUP, deployment.USER_ADMIN_FLAG, "USERADMIN_CLIENT_ID")
+         "CLOUDSHIFT_TENANTS_JSON", deployment.OPERATOR_GROUP, deployment.USER_ADMIN_FLAG)
 
 
 def quote(value):
@@ -46,9 +48,11 @@ def vault_name(group):
     return names[0]
 
 
-def settings_text(plain, secrets):
+def settings_text(plain, secrets, federation=False):
     values = {"CLOUDSHIFT_DEMO_MODE": "false"}
     values.update({key: plain[key] for key in PLAIN if plain.get(key)})
+    if federation:
+        values[deployment.FEDERATION] = "true"
     values.update(secrets)
     lines = ["# Private generated local configuration, rebuilt from Azure. Never commit or share."]
     lines += [f"{key}={quote(value)}" for key, value in values.items()]
@@ -81,7 +85,9 @@ def main():
         raise SetupError(f"{args.out.name} already exists; nothing to recover.")
     progress = deployment.Progress(3)
     progress.step("Reading AIO's settings from the Container App")
-    plain = app_settings(deployment.app_details(args.resource_group, args.name))
+    app = deployment.app_details(args.resource_group, args.name)
+    plain = app_settings(app)
+    federation = deployment.app_is_federated(app)
     missing = [key for key in ("ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "GRAPH_CLIENT_ID") if not plain.get(key)]
     if missing:
         raise SetupError("The Container App is missing: " + ", ".join(missing))
@@ -90,9 +96,8 @@ def main():
         raise SetupError("Azure CLI is signed in to a different tenant than this AIO install.")
     progress.step("Reading the secrets from Key Vault")
     vault = vault_name(args.resource_group)
-    names = dict(deployment.SECRETS)
-    if plain.get(deployment.USER_ADMIN_FLAG) == "true":
-        names.update(deployment.USER_ADMIN_SECRETS)
+    # Same selection the deploy uses: no graph-client-secret for a federated install.
+    names = deployment.secret_names({deployment.FEDERATION: "true" if federation else "false"})
     secrets = {}
     try:
         for secret, key in names.items():
@@ -104,8 +109,10 @@ def main():
         raise SetupError(f"Could not read the secrets from Key Vault {vault}. Run this as the account that "
                          "installed AIO, or give your account 'Key Vault Secrets User' on that vault.") from None
     progress.step("Writing " + args.out.name + " (private)")
-    write_private(args.out, settings_text(plain, secrets))
+    write_private(args.out, settings_text(plain, secrets, federation))
     progress.finish()
+    if federation:
+        print("This install uses workload identity federation; the file holds no inventory client secret.")
     print(f"Rebuilt {args.out.name}. Updates work again: bash install.sh (Cloud Shell) or deploy-azure.py.")
 
 

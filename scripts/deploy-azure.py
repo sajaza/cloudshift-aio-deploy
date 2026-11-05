@@ -2,9 +2,11 @@
 """Host cloudshift AIO on Azure Container Apps through the signed-in Azure CLI session (macOS, Linux or Windows).
 
 Reads the private configuration from register-entra.py, stores the three secrets in Key Vault
-(four when user creation is on; see enable-user-admin.py),
+(one fewer with --federation),
 builds the image in Azure Container Registry, deploys infra/main.bicep, and adds the hosted
 sign-in redirect to the operators registration. Never prints credential values.
+With --federation the inventory app trusts the Container App's managed identity (workload identity
+federation) and needs no client secret; --remove-secrets then deletes its old secrets on request.
 Python standard library only. Run --plan to inspect changes without Azure access.
 """
 import argparse
@@ -29,16 +31,30 @@ TEMPLATE = ROOT / "infra" / "main.bicep"
 DEFAULT_ENV = ROOT / ".env.entra.generated"
 PROVIDERS = ("Microsoft.App", "Microsoft.OperationalInsights", "Microsoft.ContainerRegistry",
              "Microsoft.KeyVault", "Microsoft.ManagedIdentity")
-REQUIRED = ("NEXTAUTH_SECRET", "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "ENTRA_CLIENT_SECRET",
-            "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET")
+REQUIRED = ("NEXTAUTH_SECRET", "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "GRAPH_CLIENT_ID")
 # At least one is required: listed operator object IDs, or an Entra group whose members are operators.
 OPERATOR_IDS, OPERATOR_GROUP = "CLOUDSHIFT_OPERATOR_IDS", "CLOUDSHIFT_OPERATOR_GROUP_ID"
 # Key Vault secret name -> environment variable. Must match secretNames in main.bicep.
 SECRETS = {"nextauth-secret": "NEXTAUTH_SECRET", "entra-client-secret": "ENTRA_CLIENT_SECRET",
            "graph-client-secret": "GRAPH_CLIENT_SECRET"}
-# Optional "cloudshift user admin" write app (User.ReadWrite.All only), set up by enable-user-admin.py.
+# App registration -> (Key Vault secret name, setting holding its client secret, setting holding its app ID).
+# Apps in FEDERATED_APPS need no secret when workload identity federation is on. The operators app
+# already gets a federated identity credential; adding "operators" here later drops entra-client-secret
+# the same way, once sign-in uses federatedClientAssertion().
+APP_SECRETS = {"inventory": ("graph-client-secret", "GRAPH_CLIENT_SECRET", "GRAPH_CLIENT_ID"),
+               "operators": ("entra-client-secret", "ENTRA_CLIENT_SECRET", "ENTRA_CLIENT_ID")}
+FEDERATED_APPS = ("inventory",)
+# Deploy-time switch kept in the private settings file; the app itself reads FEDERATED_ENV.
+FEDERATION = "CLOUDSHIFT_USE_FEDERATION"
+FEDERATED_ENV = "CLOUDSHIFT_FEDERATED_IDENTITY_CLIENT_ID"
+FIC_NAME = "cloudshift-aio-container"
+FIC_AUDIENCE = "api://AzureADTokenExchange"
+FIC_LIMIT = 20  # Entra allows at most 20 federated identity credentials per application.
+# Optional "Add user" feature, set up by enable-user-admin.py. It writes with the signed-in operator's
+# delegated Graph token, so it adds no app, secret or application permission.
 USER_ADMIN_FLAG = "CLOUDSHIFT_ENABLE_USER_ADMIN"
-USER_ADMIN_SECRETS = {"useradmin-client-secret": "USERADMIN_CLIENT_SECRET"}
+# Settings of the retired app-only "cloudshift user admin" registration: ignored, never uploaded.
+LEGACY_USER_ADMIN = ("USERADMIN_CLIENT_ID", "USERADMIN_CLIENT_SECRET")
 # Features the hosted template does not configure yet; a local-only setting is ignored, not copied.
 UNSUPPORTED = ("CLOUDSHIFT_GDAP_DISCOVERY", "CLOUDSHIFT_PARTNER_DISCOVERY", "CLOUDSHIFT_ENABLE_DEPLOYMENTS")
 CALLBACK = "/api/auth/callback/azure-ad"
@@ -77,7 +93,8 @@ def parse_env(text):
     return values
 
 
-def load_settings(path, check_user_admin=True):
+def load_settings(path, check_user_admin=True, federation=None):
+    """federation: True/False overrides the file's CLOUDSHIFT_USE_FEDERATION; None uses the file."""
     if path.is_symlink() or not path.is_file():
         raise SetupError(f"Configuration file {path.name} not found. Run scripts/register-entra.py first.")
     # Windows protects files in the user profile with ACLs rather than mode bits.
@@ -86,9 +103,14 @@ def load_settings(path, check_user_admin=True):
     values = parse_env(path.read_text(encoding="utf-8"))
     if values.get("CLOUDSHIFT_DEMO_MODE", "false") != "false":
         raise SetupError("Demo mode cannot be hosted. Use the live configuration from register-entra.py.")
-    missing = [key for key in REQUIRED if not values.get(key)]
+    flag = values.get(FEDERATION, "false") or "false"
+    if flag not in ("true", "false"):
+        raise SetupError(FEDERATION + " must be 'true' or 'false'.")
+    values[FEDERATION] = "true" if (flag == "true" if federation is None else federation) else "false"
+    missing = [key for key in REQUIRED + tuple(secret_settings(values)) if not values.get(key)]
     if missing:
-        raise SetupError("Missing configuration: " + ", ".join(missing))
+        hint = (" (or deploy with --federation)" if "GRAPH_CLIENT_SECRET" in missing else "")
+        raise SetupError("Missing configuration: " + ", ".join(missing) + hint)
     if len(values["NEXTAUTH_SECRET"]) < 32:
         raise SetupError("NEXTAUTH_SECRET must contain at least 32 characters.")
     for key in ("ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "GRAPH_CLIENT_ID"):
@@ -115,7 +137,25 @@ def load_settings(path, check_user_admin=True):
     values["CLOUDSHIFT_TENANTS_JSON"] = json.dumps(tenants, separators=(",", ":"))
     if check_user_admin:
         check_user_admin_settings(values)
+    legacy_user_admin_note(values, path)
     return values
+
+
+def federated(settings):
+    return settings.get(FEDERATION) == "true"
+
+
+def secret_settings(settings):
+    """Settings holding client secrets that this deployment still needs."""
+    return [env for app, (_, env, _) in APP_SECRETS.items()
+            if not (federated(settings) and app in FEDERATED_APPS)]
+
+
+def app_is_federated(app):
+    """True when a deployed Container App already authenticates the inventory app by federation."""
+    containers = (app or {}).get("properties", {}).get("template", {}).get("containers") or []
+    return any(isinstance(item, dict) and item.get("name") == FEDERATED_ENV and item.get("value")
+               for container in containers for item in container.get("env", []) or [])
 
 
 def user_admin_enabled(settings):
@@ -123,20 +163,33 @@ def user_admin_enabled(settings):
 
 
 def check_user_admin_settings(values):
-    """The optional write app must be complete and separate from the sign-in and read-only apps."""
+    """The Add user flag must be 'true' or 'false'; it needs no credentials of its own."""
     flag = values.get(USER_ADMIN_FLAG, "false")
     if flag not in ("true", "false", ""):
         raise SetupError(USER_ADMIN_FLAG + " must be 'true' or 'false'.")
-    if flag != "true":
+
+
+def legacy_app_id(values):
+    """Client ID of the retired 'cloudshift user admin' app named in an old file, if readable."""
+    try:
+        return identifier(values.get("USERADMIN_CLIENT_ID"))
+    except SetupError:
+        return None
+
+
+def legacy_user_admin_note(values, path):
+    """Old files may still name the retired write app. Its settings are dropped (never deployed or
+    uploaded) and a note says how to delete it. Prints the client ID only, never the secret."""
+    if not any(values.get(key) for key in LEGACY_USER_ADMIN):
         return
-    missing = [key for key in ("USERADMIN_CLIENT_ID", "USERADMIN_CLIENT_SECRET") if not values.get(key)]
-    if missing:
-        raise SetupError("User creation is on but configuration is missing: " + ", ".join(missing) +
-                         ". Run scripts/enable-user-admin.py, or set " + USER_ADMIN_FLAG + "='false'.")
-    values["USERADMIN_CLIENT_ID"] = identifier(values["USERADMIN_CLIENT_ID"])
-    if values["USERADMIN_CLIENT_ID"] in (values["ENTRA_CLIENT_ID"], values["GRAPH_CLIENT_ID"]):
-        raise SetupError("USERADMIN_CLIENT_ID must be its own 'cloudshift user admin' registration, "
-                         "not the sign-in or inventory app.")
+    app_id = legacy_app_id(values)
+    for key in LEGACY_USER_ADMIN:
+        values.pop(key, None)
+    print(f"Note: {path.name} still has USERADMIN_ settings for the retired 'cloudshift user admin' app. "
+          "They are ignored: Add user now writes as the signed-in operator.")
+    how = f"az ad app delete --id {app_id}" if app_id else "Entra → App registrations → cloudshift user admin → Delete"
+    print("  Delete that app registration so its application permission and secret stop working: " + how)
+    print("  Then remove the USERADMIN_ lines (scripts/enable-user-admin.py does that for you).")
 
 
 def template_parameters(settings, name, deployer_id, image="", domain=None, certificate_id=None):
@@ -148,9 +201,10 @@ def template_parameters(settings, name, deployer_id, image="", domain=None, cert
         "graphClientId": settings["GRAPH_CLIENT_ID"], "operatorIds": settings[OPERATOR_IDS],
         "operatorGroupId": settings.get(OPERATOR_GROUP, ""),
         "tenantsJson": settings["CLOUDSHIFT_TENANTS_JSON"],
-        # Only the write app's client ID; its secret is a Key Vault reference like the others.
+        # Only switches the Add user feature on; writes use each operator's delegated token.
         "enableUserAdmin": user_admin_enabled(settings),
-        "userAdminClientId": settings["USERADMIN_CLIENT_ID"] if user_admin_enabled(settings) else "",
+        # The template reads the identity's client ID itself, so it always matches the identity it attaches.
+        "useFederation": federated(settings),
     }
     return {"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
             "contentVersion": "1.0.0.0", "parameters": {k: {"value": v} for k, v in parameters.items()}}
@@ -421,8 +475,10 @@ def grant_app_roles(app_id, names):
 
 
 def secret_names(settings):
-    """Key Vault secret name -> setting; the write app's secret only when user creation is on."""
-    return {**SECRETS, **(USER_ADMIN_SECRETS if user_admin_enabled(settings) else {})}
+    """Key Vault secret name -> setting, with no secret for an app that uses workload identity
+    federation. Add user needs no secret of its own."""
+    dropped = {APP_SECRETS[app][0] for app in FEDERATED_APPS} if federated(settings) else set()
+    return {name: key for name, key in SECRETS.items() if name not in dropped}
 
 
 def store_secrets(vault, settings):
@@ -438,9 +494,115 @@ def store_secrets(vault, settings):
                 except SetupError:
                     if attempt == 7:
                         raise
+                    if attempt == 0:
+                        # A secret removed by --remove-secrets is soft-deleted; restore it before rewriting
+                        # it (rollback). Fails harmlessly when nothing was deleted.
+                        try:
+                            cli(["keyvault", "secret", "recover", "--vault-name", vault, "--name", secret])
+                        except SetupError:
+                            pass
                     print("  waiting for Key Vault access to propagate…")
                     time.sleep(20)
             print(f"  stored {secret}")
+
+
+def federated_credential(tenant_id, principal_id):
+    """The trust Entra checks when the app presents a managed-identity token instead of a secret."""
+    return {"name": FIC_NAME, "issuer": f"https://login.microsoftonline.com/{identifier(tenant_id)}/v2.0",
+            "subject": identifier(principal_id), "audiences": [FIC_AUDIENCE],
+            "description": "cloudshift AIO Container App managed identity (workload identity federation)"}
+
+
+def ensure_federated_credential(app_id, tenant_id, principal_id):
+    """Idempotently trust the managed identity: 'present' when an identical trust exists, 'created', or
+    'replaced' when cloudshift-aio-container pointed at a different identity. Other credentials stay."""
+    app_id, wanted = identifier(app_id), federated_credential(tenant_id, principal_id)
+    current = [item for item in cli(["ad", "app", "federated-credential", "list", "--id", app_id]) or []
+               if isinstance(item, dict)]
+
+    def matches(item):
+        return (item.get("issuer") == wanted["issuer"] and item.get("subject") == wanted["subject"]
+                and FIC_AUDIENCE in (item.get("audiences") or []))
+
+    named = next((item for item in current if item.get("name") == FIC_NAME), None)
+    if named and matches(named):
+        return "present"
+    outcome = "created"
+    if named:
+        # Name is immutable and issuer+subject must be unique per app: delete, then recreate.
+        cli(["ad", "app", "federated-credential", "delete", "--id", app_id,
+             "--federated-credential-id", str(named.get("id") or FIC_NAME)])
+        current.remove(named)
+        outcome = "replaced"
+    if any(matches(item) for item in current):
+        return "present" if outcome == "created" else outcome
+    if len(current) >= FIC_LIMIT:
+        raise SetupError(f"The app already has {FIC_LIMIT} federated identity credentials, Entra's limit; "
+                         "remove an unused one in Entra → App registrations → Certificates & secrets.")
+    with tempfile.TemporaryDirectory(prefix="cloudshift-deploy-") as directory:
+        body = private_temp(directory, "credential.json", json.dumps(wanted))
+        cli(["ad", "app", "federated-credential", "create", "--id", app_id, "--parameters", "@" + str(body)])
+    return outcome
+
+
+def write_setting(path, key, value):
+    """Replace, append (value) or drop (None) one KEY='value' line of the private settings file; every
+    other line is kept. Atomic, mode 0600."""
+    lines, found = [], False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        name = line.strip().removeprefix("export ").partition("=")[0].strip()
+        if name == key:
+            if value is not None and not found:
+                lines.append(f"{key}='{value}'")
+            found = True
+        else:
+            lines.append(line)
+    if not found and value is not None:
+        lines.append(f"{key}='{value}'")
+    fd, temporary = tempfile.mkstemp(prefix=".env.deploy-", dir=path.parent)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def remove_inventory_secrets(app_id, vault, env_path, confirm=None):
+    """Opt-in only (--remove-secrets): delete every client secret of the inventory app, its Key Vault
+    secret (soft-deleted, recoverable for 30 days) and its line in the settings file. Other apps'
+    credentials, certificates and federated identity credentials are never touched."""
+    app_id = identifier(app_id)
+    kv_secret, setting, _ = APP_SECRETS["inventory"]
+    credentials = [item for item in cli(["ad", "app", "credential", "list", "--id", app_id]) or []
+                   if isinstance(item, dict) and item.get("keyId")]
+    print("  WARNING: this deletes the cloudshift inventory app's client secrets. Afterwards only workload")
+    print("  identity federation can authenticate it; rolling back needs a new client secret.")
+    for item in credentials:
+        print(f"    secret {identifier(item['keyId'])}  {item.get('displayName') or '(no name)'}  "
+              f"expires {item.get('endDateTime') or 'unknown'}")
+    print(f"    Key Vault secret {kv_secret} in {vault}, and {setting} in {env_path.name}")
+    if confirm is None:
+        confirm = (lambda: input("  Type remove to delete them: ").strip() == "remove") if sys.stdin.isatty() \
+            else (lambda: True)
+    if not confirm():
+        print("  nothing was removed")
+        return []
+    removed = []
+    for item in credentials:
+        key_id = identifier(item["keyId"])
+        cli(["ad", "app", "credential", "delete", "--id", app_id, "--key-id", key_id])
+        removed.append(key_id)
+    try:
+        cli(["keyvault", "secret", "delete", "--vault-name", vault, "--name", kv_secret])
+    except SetupError:
+        print(f"  {kv_secret} was not in Key Vault")
+    write_setting(env_path, setting, None)
+    print(f"  removed {len(removed)} client secret(s), {kv_secret} and {setting}")
+    return removed
 
 
 def image_tag():
@@ -507,9 +669,8 @@ def plan(args):
     print(f"Resource group {args.resource_group} in {args.location}: register providers, then create")
     print("  Log Analytics, managed identity, container registry, Key Vault (RBAC), Container Apps environment.")
     print("Upload NEXTAUTH_SECRET, ENTRA_CLIENT_SECRET and GRAPH_CLIENT_SECRET to Key Vault from private temp files.")
-    print("If the configuration has " + USER_ADMIN_FLAG + "='true' (set by enable-user-admin.py), also upload")
-    print("  USERADMIN_CLIENT_SECRET as useradmin-client-secret and turn on user creation with the separate")
-    print("  'cloudshift user admin' app (User.ReadWrite.All only); with 'false' or unset, it stays off.")
+    print("If the configuration has " + USER_ADMIN_FLAG + "='true' (set by enable-user-admin.py), turn on Add")
+    print("  user: it writes as the signed-in operator (delegated, their own Entra role); no extra secret.")
     if args.image:
         print(f"Copy the published image {args.image} into the new registry with your pull token.")
     else:
@@ -521,6 +682,12 @@ def plan(args):
     print(f"Add any of the {len(READ_PERMISSIONS)} read-only Graph permissions cloudshift inventory is missing; never remove any.")
     print("With --grant-consent, admin-consent exactly those permissions before the app starts.")
     print("If the configuration has " + OPERATOR_GROUP + ", members of that Entra group may also sign in.")
+    print("With --federation (kept once used): add the federated identity credential " + FIC_NAME + " (issuer")
+    print("  https://login.microsoftonline.com/<tenant>/v2.0, subject = the managed identity's principal ID,")
+    print("  audience " + FIC_AUDIENCE + ") to cloudshift inventory and cloudshift operators; do not upload")
+    print("  graph-client-secret and do not reference it from the app. --no-federation goes back to the secret.")
+    print("With --remove-secrets (an install already running federated): list, confirm, then delete only the")
+    print("  inventory app's client secrets and the graph-client-secret Key Vault secret. Never automatic.")
     print("Customer onboarding stays manual.")
 
 
@@ -539,13 +706,23 @@ def main():
     parser.add_argument("--domain", help="Custom web address such as aio.contoso.com, or 'generic' "
                         "(default: ask, keeping any domain already in use)")
     parser.add_argument("--plan", action="store_true", help="Show changes without logging in or changing Azure")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--federation", action="store_true",
+                      help="No inventory client secret: trust the Container App's managed identity instead")
+    mode.add_argument("--no-federation", action="store_true",
+                      help="Go back to the inventory client secret (rollback; needs GRAPH_CLIENT_SECRET)")
+    parser.add_argument("--remove-secrets", action="store_true",
+                        help="After a federated install works: delete the inventory app's old client secrets")
     args = parser.parse_args()
     if not NAME.fullmatch(args.name):
         raise SetupError("--name must be 3-24 lowercase letters, digits or hyphens, starting with a letter.")
     if args.plan:
         plan(args)
         return
-    settings = load_settings(args.env_file)
+    choice = True if args.federation else False if args.no_federation else None
+    if args.remove_secrets and choice is False:
+        raise SetupError("--remove-secrets needs workload identity federation; it cannot be used with --no-federation.")
+    settings = load_settings(args.env_file, federation=choice)
     token = image_token() if args.image else None
     for key in UNSUPPORTED:
         if settings.get(key) == "true":
@@ -560,7 +737,20 @@ def main():
     if identifier(account.get("tenantId")) != settings["ENTRA_TENANT_ID"]:
         raise SetupError("Azure CLI is signed in to a different tenant than the operator registration.")
     print(f"Subscription: {account.get('name')} ({account.get('id')})")
-    existing_domain, existing_certificate = bound_domain(app_details(args.resource_group, args.name))
+    existing_app = app_details(args.resource_group, args.name)
+    was_federated = app_is_federated(existing_app)
+    if choice is None and was_federated and not federated(settings):
+        # Never fall back to a secret silently: an install that runs federated stays federated.
+        settings = load_settings(args.env_file, federation=True)
+        print("This install uses workload identity federation; keeping it (rerun with --no-federation to undo).")
+    if args.remove_secrets and not (federated(settings) and was_federated):
+        raise SetupError("--remove-secrets only runs on an install that already runs federated. Deploy with "
+                         "--federation, sign in and check data appears, then rerun with --remove-secrets.")
+    if federated(settings):
+        progress.total += 1
+    if args.remove_secrets:
+        progress.total += 1
+    existing_domain, existing_certificate = bound_domain(existing_app)
     domain = choose_domain(args.domain, existing_domain)
     certificate_id = existing_certificate if domain and domain == existing_domain else None
     if domain and not certificate_id:
@@ -575,6 +765,22 @@ def main():
     base = deploy(args.resource_group, settings, args.name, deployer_id)
     progress.step("Storing secrets in Key Vault " + base["vaultName"], "under 1 min")
     store_secrets(base["vaultName"], settings)
+    if federated(settings):
+        progress.step("Trusting the Container App's managed identity (no inventory client secret)", "seconds")
+        for app in ("inventory", "operators"):
+            app_id = settings[APP_SECRETS[app][2]]
+            try:
+                outcome = ensure_federated_credential(app_id, settings["ENTRA_TENANT_ID"],
+                                                      base["identityPrincipalId"])
+            except SetupError:
+                if app in FEDERATED_APPS:
+                    raise SetupError(f"Could not add the federated identity credential to cloudshift {app}. "
+                                     "Run this as an owner of that app registration or an Application "
+                                     "Administrator, or rerun with --no-federation.") from None
+                print(f"  could not add it to cloudshift {app}; sign-in still uses its client secret")
+                continue
+            print(f"  cloudshift {app}: {FIC_NAME} {outcome}")
+        print("  new trusts can take a few minutes to apply; early Microsoft requests may fail meanwhile")
     # Before the app starts, so its first Graph token already carries every role.
     progress.step(f"Giving cloudshift inventory its {len(READ_PERMISSIONS)} read-only permissions", "under 1 min")
     consented = permissions_ok = False
@@ -613,6 +819,12 @@ def main():
         else:
             print("  kept the generic address; rerun with --domain " + domain + " once DNS is in place")
     public_url = outputs.get("publicUrl") or app_url
+    # Remember the mode so a plain rerun (install.sh) keeps it.
+    if parse_env(args.env_file.read_text(encoding="utf-8")).get(FEDERATION, "false") != settings[FEDERATION]:
+        write_setting(args.env_file, FEDERATION, settings[FEDERATION])
+    if args.remove_secrets:
+        progress.step("Removing the inventory app's old client secrets (--remove-secrets)")
+        remove_inventory_secrets(settings["GRAPH_CLIENT_ID"], base["vaultName"], args.env_file)
     progress.step("Adding the hosted sign-in address to cloudshift operators")
     registration = cli(["ad", "app", "show", "--id", settings["ENTRA_CLIENT_ID"]])
     redirects = merged_redirects(registration.get("web", {}).get("redirectUris", []), app_url, public_url)
@@ -630,8 +842,12 @@ def main():
         print(f"{lead} admin consent: Entra → App registrations → cloudshift inventory → API permissions")
         print("  → Grant admin consent, then restart the app (Container App → Revisions → Restart).")
         print("  Or rerun this command with --grant-consent as a Global or Privileged Role Administrator.")
+    if federated(settings):
+        print("cloudshift inventory uses workload identity federation: the app holds no inventory client secret.")
+        if not args.remove_secrets:
+            print("  Once sign-in and data work, rerun with --remove-secrets to delete its old client secrets.")
     if user_admin_enabled(settings):
-        print("User creation is on, using the separate 'cloudshift user admin' registration.")
+        print("User creation is on. It runs as the signed-in operator, who needs User Administrator in Entra.")
     if settings[OPERATOR_GROUP]:
         print("Members of the Entra group " + settings[OPERATOR_GROUP] + " may sign in, as well as any listed")
         print("  operator IDs. Removing someone from the group takes effect within about 10 minutes.")

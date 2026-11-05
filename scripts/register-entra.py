@@ -26,6 +26,8 @@ STATE_PATH = ROOT / ".env.registration-state.json"
 OUTPUT_PATH = ROOT / ".env.entra.generated"
 # Optional Entra security group whose direct and nested members may sign in to AIO.
 OPERATOR_GROUP = "CLOUDSHIFT_OPERATOR_GROUP_ID"
+# Set by deploy-azure.py --federation: the hosted inventory app uses workload identity federation.
+FEDERATION = "CLOUDSHIFT_USE_FEDERATION"
 
 
 class SetupError(Exception):
@@ -222,7 +224,9 @@ def set_env_value(path, key, value):
     private_write(path, "\n".join(lines) + "\n")
 
 
-def environment(state, tenant_name, operator_group=""):
+def environment(state, tenant_name, operator_group="", federation=False, inventory_secret=True):
+    """federation keeps a hosted install federated; inventory_secret=False leaves out a client secret
+    that deploy-azure.py --remove-secrets already deleted."""
     a, b = state["apps"]["operators"], state["apps"]["inventory"]
     values = {
         "CLOUDSHIFT_DEMO_MODE": "false", "NEXTAUTH_URL": "http://localhost:3000",
@@ -235,6 +239,10 @@ def environment(state, tenant_name, operator_group=""):
     }
     if operator_group:
         values[OPERATOR_GROUP] = identifier(operator_group)
+    if federation:
+        values[FEDERATION] = "true"
+        if not inventory_secret:
+            del values["GRAPH_CLIENT_SECRET"]
     return "# Private generated local configuration. Never commit or share.\n" + "\n".join(k + "=" + quote(v) for k, v in values.items()) + "\n"
 
 
@@ -292,10 +300,15 @@ def main():
     for key, definition in definitions.items():
         print("Preparing " + definition["displayName"] + "…")
         provision_app(key, definition, state)
-    if not operator_group and OUTPUT_PATH.is_file() and not OUTPUT_PATH.is_symlink():
+    federation, inventory_secret = False, True
+    if OUTPUT_PATH.is_file() and not OUTPUT_PATH.is_symlink():
+        previous = read_private_env(OUTPUT_PATH)
         # Keep an operator group saved by an earlier run or by --set-operator-group.
-        operator_group = env_value(read_private_env(OUTPUT_PATH), OPERATOR_GROUP)
-    private_write(OUTPUT_PATH, environment(state, args.tenant_name, operator_group))
+        operator_group = operator_group or env_value(previous, OPERATOR_GROUP)
+        # Keep a hosted install federated, and do not restore a client secret it already removed.
+        federation = env_value(previous, FEDERATION) == "true"
+        inventory_secret = bool(env_value(previous, "GRAPH_CLIENT_SECRET"))
+    private_write(OUTPUT_PATH, environment(state, args.tenant_name, operator_group, federation, inventory_secret))
     if args.for_hosting:
         print("App registrations ready; private configuration saved for the hosting step.")
         return
