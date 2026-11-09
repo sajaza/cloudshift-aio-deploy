@@ -44,6 +44,9 @@ param customDomainCertificateId string = ''
 @description('Optional Add user feature. Writes run as the signed-in operator with a delegated Microsoft Graph token, limited to their own Entra role, so no write app or secret is deployed.')
 param enableUserAdmin bool = false
 
+@description('Optional Azure Virtual Desktop area. Azure calls run as the signed-in operator with a delegated Azure Resource Manager token, limited to their own Azure roles, so AIO gets no Azure role assignment.')
+param enableAvd bool = false
+
 @description('No inventory client secret: the inventory app trusts the managed identity of this Container App through workload identity federation. Off keeps the client secret.')
 param useFederation bool = false
 
@@ -59,6 +62,8 @@ var secretNames = useFederation
   : ['nextauth-secret', 'entra-client-secret', 'graph-client-secret']
 // Add user needs only its flag: there is no separate write app, client ID or secret.
 var userAdminEnv = enableUserAdmin ? [{ name: 'CLOUDSHIFT_ENABLE_USER_ADMIN', value: 'true' }] : []
+// Azure Virtual Desktop needs only its flag: no role assignment, identity or secret is added for it.
+var avdEnv = enableAvd ? [{ name: 'CLOUDSHIFT_ENABLE_AVD', value: 'true' }] : []
 // Inventory credential: the identity's client ID for federation, otherwise the Key Vault secret.
 var graphCredentialEnv = useFederation
   ? [{ name: 'CLOUDSHIFT_FEDERATED_IDENTITY_CLIENT_ID', value: identity.properties.clientId }]
@@ -201,7 +206,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
           ], graphCredentialEnv, [
             { name: 'CLOUDSHIFT_OPERATOR_IDS', value: operatorIds }
             { name: 'CLOUDSHIFT_TENANTS_JSON', value: tenantsJson }
-          ], operatorGroupEnv, userAdminEnv)
+          ], operatorGroupEnv, userAdminEnv, avdEnv)
           probes: [
             {
               type: 'Startup'

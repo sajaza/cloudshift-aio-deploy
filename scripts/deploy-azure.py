@@ -55,6 +55,9 @@ FIC_LIMIT = 20  # Entra allows at most 20 federated identity credentials per app
 USER_ADMIN_FLAG = "CLOUDSHIFT_ENABLE_USER_ADMIN"
 # Settings of the retired app-only "cloudshift user admin" registration: ignored, never uploaded.
 LEGACY_USER_ADMIN = ("USERADMIN_CLIENT_ID", "USERADMIN_CLIENT_SECRET")
+# Optional Azure Virtual Desktop area, set up by enable-avd.py. It calls Azure Resource Manager with the
+# signed-in operator's delegated token (their own Azure RBAC), so AIO gets no Azure role of its own.
+AVD_FLAG = "CLOUDSHIFT_ENABLE_AVD"
 # Features the hosted template does not configure yet; a local-only setting is ignored, not copied.
 UNSUPPORTED = ("CLOUDSHIFT_GDAP_DISCOVERY", "CLOUDSHIFT_PARTNER_DISCOVERY", "CLOUDSHIFT_ENABLE_DEPLOYMENTS")
 CALLBACK = "/api/auth/callback/azure-ad"
@@ -93,7 +96,7 @@ def parse_env(text):
     return values
 
 
-def load_settings(path, check_user_admin=True, federation=None):
+def load_settings(path, check_user_admin=True, federation=None, check_avd=True):
     """federation: True/False overrides the file's CLOUDSHIFT_USE_FEDERATION; None uses the file."""
     if path.is_symlink() or not path.is_file():
         raise SetupError(f"Configuration file {path.name} not found. Run scripts/register-entra.py first.")
@@ -137,6 +140,8 @@ def load_settings(path, check_user_admin=True, federation=None):
     values["CLOUDSHIFT_TENANTS_JSON"] = json.dumps(tenants, separators=(",", ":"))
     if check_user_admin:
         check_user_admin_settings(values)
+    if check_avd:
+        check_avd_settings(values)
     legacy_user_admin_note(values, path)
     return values
 
@@ -167,6 +172,16 @@ def check_user_admin_settings(values):
     flag = values.get(USER_ADMIN_FLAG, "false")
     if flag not in ("true", "false", ""):
         raise SetupError(USER_ADMIN_FLAG + " must be 'true' or 'false'.")
+
+
+def avd_enabled(settings):
+    return settings.get(AVD_FLAG, "false") == "true"
+
+
+def check_avd_settings(values):
+    """The Azure Virtual Desktop flag must be 'true' or 'false'; it needs no credentials of its own."""
+    if values.get(AVD_FLAG, "false") not in ("true", "false", ""):
+        raise SetupError(AVD_FLAG + " must be 'true' or 'false'.")
 
 
 def legacy_app_id(values):
@@ -203,6 +218,8 @@ def template_parameters(settings, name, deployer_id, image="", domain=None, cert
         "tenantsJson": settings["CLOUDSHIFT_TENANTS_JSON"],
         # Only switches the Add user feature on; writes use each operator's delegated token.
         "enableUserAdmin": user_admin_enabled(settings),
+        # Only switches the Azure Virtual Desktop area on; Azure calls use each operator's delegated token.
+        "enableAvd": avd_enabled(settings),
         # The template reads the identity's client ID itself, so it always matches the identity it attaches.
         "useFederation": federated(settings),
     }
@@ -671,6 +688,8 @@ def plan(args):
     print("Upload NEXTAUTH_SECRET, ENTRA_CLIENT_SECRET and GRAPH_CLIENT_SECRET to Key Vault from private temp files.")
     print("If the configuration has " + USER_ADMIN_FLAG + "='true' (set by enable-user-admin.py), turn on Add")
     print("  user: it writes as the signed-in operator (delegated, their own Entra role); no extra secret.")
+    print("If the configuration has " + AVD_FLAG + "='true' (set by enable-avd.py), turn on the Azure Virtual")
+    print("  Desktop area: it calls Azure as the signed-in operator (their own Azure roles); AIO gets no Azure role.")
     if args.image:
         print(f"Copy the published image {args.image} into the new registry with your pull token.")
     else:
@@ -848,6 +867,9 @@ def main():
             print("  Once sign-in and data work, rerun with --remove-secrets to delete its old client secrets.")
     if user_admin_enabled(settings):
         print("User creation is on. It runs as the signed-in operator, who needs User Administrator in Entra.")
+    if avd_enabled(settings):
+        print("Azure Virtual Desktop is on. It runs as the signed-in operator, who needs Azure roles on the")
+        print("  target subscription or resource group (Contributor + User Access Administrator, or Owner).")
     if settings[OPERATOR_GROUP]:
         print("Members of the Entra group " + settings[OPERATOR_GROUP] + " may sign in, as well as any listed")
         print("  operator IDs. Removing someone from the group takes effect within about 10 minutes.")

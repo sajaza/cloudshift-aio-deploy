@@ -64,3 +64,7 @@ echo
 echo "Step B: hosting (you will be asked for the image pull token you were given)"
 python3 scripts/deploy-azure.py --env-file .env.entra.generated --image "$IMAGE" --location "$region" \
   "${consent[@]}" "${federation[@]}"
+
+echo
+echo "Optional: to build and view Azure Virtual Desktop from AIO, run once per tenant"
+echo "  python3 scripts/enable-avd.py --env-file .env.entra.generated, then bash install.sh again (see docs/AVD.md)."
