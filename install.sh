@@ -35,7 +35,7 @@ consent=()
 federation=()
 [[ "${CLOUDSHIFT_FEDERATION:-false}" == "true" ]] && federation=(--federation)
 echo "AIO reads users, groups, devices, sign-ins, roles, apps, Intune, Defender, Secure Score, SharePoint,"
-echo "usage reports and Microsoft 365 health through Microsoft Graph, with 23 read-only permissions. It cannot change anything."
+echo "usage reports and Microsoft 365 health through Microsoft Graph, with 31 read-only permissions. It cannot change anything."
 read -rp "Grant admin consent for that now? Needs Global Administrator or Privileged Role Administrator. [Y/n] " answer
 [[ "$answer" =~ ^[Nn]$ ]] || consent=(--grant-consent)
 

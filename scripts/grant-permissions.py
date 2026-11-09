@@ -56,16 +56,36 @@ CHECKS = (
     ("SharePoint sites", "Sites.Read.All", "/v1.0/sites/root?$select=id"),
     # Answers 302 to a short-lived CSV download; the redirect is not followed (see graph_status).
     ("Usage reports", "Reports.Read.All", "/v1.0/reports/getOffice365ActivationsUserCounts"),
+    ("Partner names", "CrossTenantInformation.ReadBasic.All",
+     "/v1.0/tenantRelationships/findTenantInformationByDomainName(domainName='microsoft.com')"),
+    ("Configuration drift", "ConfigurationMonitoring.Read.All",
+     "/v1.0/admin/configurationManagement/configurationMonitors"),
+    # POST is the documented query verb; the body is the fixed HUNTING_CHECK_BODY (see graph_status).
+    ("Advanced hunting", "ThreatHunting.Read.All", "/v1.0/security/runHuntingQuery"),
+    ("Sensitivity labels", "SensitivityLabel.Read", "/v1.0/security/dataSecurityAndGovernance/sensitivityLabels"),
+    ("Teams app catalogue", "AppCatalog.Read.All",
+     "/v1.0/appCatalogs/teamsApps?$filter=distributionMethod%20eq%20'organization'"),
+    # Key IDs and dates only: the recovery key is returned only for $select=key, which is never sent.
+    ("BitLocker key IDs", "BitlockerKey.ReadBasic.All", "/v1.0/informationProtection/bitlocker/recoveryKeys"),
+    ("Teams phone numbers", "TeamsTelephoneNumber.Read.All",
+     "/v1.0/admin/teams/telephoneNumberManagement/numberAssignments?$top=1"),
+    ("Teams user configuration", "TeamsUserConfiguration.Read.All", "/v1.0/admin/teams/userConfigurations?$top=1"),
 )
+HUNTING_PATH = "/v1.0/security/runHuntingQuery"
+# Fixed read-only KQL used only to prove ThreatHunting.Read.All works; never built from input.
+HUNTING_CHECK_BODY = {"Query": "DeviceInfo | take 1"}
 # Areas that also need a product licence in the tenant, not just consent.
 LICENSED = {"DeviceManagementManagedDevices.Read.All": "Intune", "DeviceManagementApps.Read.All": "Intune",
             "DeviceManagementConfiguration.Read.All": "Intune", "DeviceManagementServiceConfig.Read.All": "Intune",
             "SecurityIncident.Read.All": "Microsoft Defender XDR", "SecurityAlert.Read.All": "Microsoft Defender XDR",
             "IdentityRiskyUser.Read.All": "Microsoft Entra ID P2",
-            "IdentityRiskEvent.Read.All": "Microsoft Entra ID P2", "Sites.Read.All": "SharePoint Online"}
+            "IdentityRiskEvent.Read.All": "Microsoft Entra ID P2", "Sites.Read.All": "SharePoint Online",
+            "ThreatHunting.Read.All": "Microsoft Defender for Endpoint",
+            "SensitivityLabel.Read": "Microsoft Purview Information Protection"}
 # Areas whose check passes on any tenant but where part of the AIO area needs a licence.
 PARTLY_LICENSED = {"AuditLog.Read.All": "sign-in logs (Sign-ins, MFA, Inactive users) also need Microsoft Entra ID P1",
-                   "Reports.Read.All": "Copilot usage reports also need Microsoft 365 Copilot licences"}
+                   "Reports.Read.All": "Copilot usage reports also need Microsoft 365 Copilot licences",
+                   "TeamsTelephoneNumber.Read.All": "phone numbers exist only with Teams Phone"}
 WAIT_SECONDS = 300  # new consent usually reaches app tokens within a few minutes
 
 
@@ -113,11 +133,18 @@ OPENER = urllib.request.build_opener(NoRedirect)
 def graph_status(path, token):
     """(HTTP status, Graph error code) for one request. Response bodies are never printed.
 
+    Every check is a GET except advanced hunting, whose documented read verb is POST with a fixed query.
+
     A 302/303 from Graph means it authorised the report and issued a download link, so it counts as 200;
     the link (on a reports host) is not fetched.
     """
-    request = urllib.request.Request("https://graph.microsoft.com" + path,
-                                     headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+    headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
+    data = None
+    if path == HUNTING_PATH:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(HUNTING_CHECK_BODY).encode()
+    request = urllib.request.Request("https://graph.microsoft.com" + path, data=data, headers=headers,
+                                     method="POST" if data else "GET")
     try:
         with OPENER.open(request, timeout=30) as response:
             return response.status, ""

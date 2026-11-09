@@ -28,4 +28,13 @@ READ_PERMISSIONS = (
     "Sites.Read.All",                           # SharePoint sites
     "Reports.Read.All",                         # Usage reports: OneDrive, Mailbox Activity/Statistics, Teams
                                                 # Activity, Group Usage, Graph/Office Reports, Copilot reports
+    # Wave 4 blades
+    "CrossTenantInformation.ReadBasic.All",     # Partner Relationships (organisation names)
+    "ConfigurationMonitoring.Read.All",         # Standards & Drift (Microsoft configuration drift)
+    "ThreatHunting.Read.All",                   # Vulnerabilities, Vulnerability Report (fixed hunting queries)
+    "SensitivityLabel.Read",                    # Sensitivity Labels
+    "AppCatalog.Read.All",                      # Agent365 Packages (org Teams app catalogue)
+    "BitlockerKey.ReadBasic.All",               # BitLocker Key Search (key IDs only, never the key)
+    "TeamsTelephoneNumber.Read.All",            # Business Voice (phone numbers)
+    "TeamsUserConfiguration.Read.All",          # Business Voice (who a number is assigned to)
 )
