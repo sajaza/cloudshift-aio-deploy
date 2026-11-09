@@ -50,6 +50,9 @@ param enableAvd bool = false
 @description('No inventory client secret: the inventory app trusts the managed identity of this Container App through workload identity federation. Off keeps the client secret.')
 param useFederation bool = false
 
+@description('Keep AIO\'s own data (templates, documentation notes, audit records) on an Azure Files share mounted at /app/.cloudshift, so it survives restarts and updates. Without it that data lives only in the running container.')
+param persistentStorage bool = true
+
 var suffix = uniqueString(resourceGroup().id)
 var roles = {
   acrPull: '7f951dda-4ed3-4680-a7ca-43fe172d538d'
@@ -68,6 +71,12 @@ var avdEnv = enableAvd ? [{ name: 'CLOUDSHIFT_ENABLE_AVD', value: 'true' }] : []
 var graphCredentialEnv = useFederation
   ? [{ name: 'CLOUDSHIFT_FEDERATED_IDENTITY_CLIENT_ID', value: identity.properties.clientId }]
   : [{ name: 'GRAPH_CLIENT_SECRET', secretRef: 'graph-client-secret' }]
+// Container user (Dockerfile: uid/gid 10001) owns the share; only that user can read or write it.
+var dataMountOptions = 'uid=10001,gid=10001,dir_mode=0700,file_mode=0600,nobrl'
+var dataVolumes = persistentStorage
+  ? [{ name: 'data', storageType: 'AzureFile', storageName: 'cloudshift-data', mountOptions: dataMountOptions }]
+  : []
+var dataMounts = persistentStorage ? [{ volumeName: 'data', mountPath: '/app/.cloudshift' }] : []
 // Set only when a group is configured.
 var operatorGroupEnv = empty(operatorGroupId) ? [] : [{ name: 'CLOUDSHIFT_OPERATOR_GROUP_ID', value: operatorGroupId }]
 
@@ -150,6 +159,65 @@ resource appEnvironment 'Microsoft.App/managedEnvironments@2024-03-01' = {
   }
 }
 
+// AIO's private data share. Container Apps without a virtual network mounts Azure Files over SMB with the
+// account key, so shared-key access and the public endpoint stay on; HTTPS/SMB 3 encryption and TLS 1.2 are
+// required, blob public access is off, and the key is held only by the Container Apps environment.
+resource dataAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = if (persistentStorage) {
+  name: take('st${suffix}', 24)
+  location: location
+  sku: { name: 'Standard_LRS' }
+  kind: 'StorageV2'
+  properties: {
+    minimumTlsVersion: 'TLS1_2'
+    supportsHttpsTrafficOnly: true
+    allowBlobPublicAccess: false
+    allowSharedKeyAccess: true
+    publicNetworkAccess: 'Enabled'
+  }
+}
+
+resource dataFiles 'Microsoft.Storage/storageAccounts/fileServices@2023-05-01' = if (persistentStorage) {
+  parent: dataAccount
+  name: 'default'
+  properties: {
+    shareDeleteRetentionPolicy: { enabled: true, days: 14 }
+  }
+}
+
+resource dataShare 'Microsoft.Storage/storageAccounts/fileServices/shares@2023-05-01' = if (persistentStorage) {
+  parent: dataFiles
+  name: 'cloudshift-data'
+  properties: { shareQuota: 5, enabledProtocols: 'SMB' }
+}
+
+// Anyone who can list the account key (Contributor on the group) can mount the share, so record every
+// file read, write and delete in the existing Log Analytics workspace.
+resource dataFilesDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = if (persistentStorage) {
+  name: 'cloudshift-data-access'
+  scope: dataFiles
+  properties: {
+    workspaceId: logs.id
+    logs: [
+      { category: 'StorageRead', enabled: true }
+      { category: 'StorageWrite', enabled: true }
+      { category: 'StorageDelete', enabled: true }
+    ]
+  }
+}
+
+resource dataStorage 'Microsoft.App/managedEnvironments/storages@2024-03-01' = if (persistentStorage) {
+  parent: appEnvironment
+  name: 'cloudshift-data'
+  properties: {
+    azureFile: {
+      accountName: dataAccount.name
+      accountKey: dataAccount.listKeys().keys[0].value
+      shareName: dataShare.name
+      accessMode: 'ReadWrite'
+    }
+  }
+}
+
 var appUrl = 'https://${name}.${appEnvironment.properties.defaultDomain}'
 var useCustomDomain = !empty(customDomain) && !empty(customDomainCertificateId)
 // Sign-in must use the address people browse to; switch only once the certificate is bound.
@@ -162,7 +230,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
     type: 'UserAssigned'
     userAssignedIdentities: { '${identity.id}': {} }
   }
-  dependsOn: [identityPull, identitySecrets]
+  dependsOn: [identityPull, identitySecrets, dataStorage]
   properties: {
     managedEnvironmentId: appEnvironment.id
     configuration: {
@@ -192,6 +260,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
           name: 'cloudshift'
           image: image
           resources: { cpu: json('0.5'), memory: '1Gi' }
+          volumeMounts: dataMounts
           env: concat([
             { name: 'NODE_ENV', value: 'production' }
             // Container Apps sets HOSTNAME to the replica name; the server must bind all interfaces.
@@ -228,6 +297,7 @@ resource app 'Microsoft.App/containerApps@2024-03-01' = if (deployApp) {
           ]
         }
       ]
+      volumes: dataVolumes
       // In-memory token caches and local file locks assume one replica.
       scale: { minReplicas: 1, maxReplicas: 1 }
     }
@@ -244,3 +314,4 @@ output vaultName string = vault.name
 // identity by its client ID.
 output identityClientId string = identity.properties.clientId
 output identityPrincipalId string = identity.properties.principalId
+output dataShareName string = persistentStorage ? 'cloudshift-data' : ''
