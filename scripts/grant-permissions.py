@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Make AIO's read-only Microsoft Graph access live in your tenant, then prove it (macOS, Linux or Windows).
+"""Make AIO's read-only Microsoft Graph and Exchange Online access live in your tenant, then prove it
+(macOS, Linux or Windows).
 
-Adds any missing read permission to cloudshift inventory, admin-consents exactly those permissions,
-calls Microsoft Graph once per area as AIO does, then restarts the hosted app so it uses the new
-access. Never prints credential values. Python standard library only.
+Adds any missing read permission to cloudshift inventory (Microsoft Graph, plus Exchange.ManageAsApp on
+Office 365 Exchange Online), admin-consents exactly those permissions, calls Microsoft Graph once per area
+as AIO does, runs one harmless read-only Exchange cmdlet (Get-OrganizationConfig), then restarts the
+hosted app so it uses the new access. Exchange also needs a read-only Exchange role
+(View-Only Organization Management), which only Exchange Online PowerShell can assign: when it is
+missing, the script prints the exact commands instead. Never prints credential values. Python standard
+library only.
 Run --check-only to only test, without changing anything.
 An install using workload identity federation whose inventory client secret was removed cannot be tested
 from here (only the Container App's managed identity can sign in as cloudshift inventory); the script
 then requests, consents and restarts, and the areas are checked in AIO itself.
 """
 import argparse
+import base64
 import importlib.util
 import json
 from pathlib import Path
@@ -70,7 +76,21 @@ CHECKS = (
     ("Teams phone numbers", "TeamsTelephoneNumber.Read.All",
      "/v1.0/admin/teams/telephoneNumberManagement/numberAssignments?$top=1"),
     ("Teams user configuration", "TeamsUserConfiguration.Read.All", "/v1.0/admin/teams/userConfigurations?$top=1"),
+    # Delivery metadata of the last 48 hours; needs Microsoft's message trace service principal (created below).
+    ("Message trace", "ExchangeMessageTrace.Read.All", "/v1.0/admin/exchange/tracing/messageTraces?$top=1"),
+    # Preview blades: only a Graph beta API exists (see src/lib/modules/graph-beta.ts). Never scriptContent.
+    ("Intune scripts (Preview)", "DeviceManagementScripts.Read.All",
+     "/beta/deviceManagement/deviceManagementScripts?$select=id"),
+    ("Cloud app discovery (Preview)", "CloudApp-Discovery.Read.All",
+     "/beta/security/dataDiscovery/cloudAppDiscovery/uploadedStreams"),
 )
+# Graph checks that call beta, because the AIO area itself is a Preview blade on a beta-only API.
+BETA_CHECKS = {"DeviceManagementScripts.Read.All", "CloudApp-Discovery.Read.All"}
+# Exchange Online live check: one fixed, harmless read-only cmdlet, never built from input.
+EXCHANGE_SCOPE = "https://outlook.office365.com/.default"
+EXCHANGE_CHECK_CMDLET = "Get-OrganizationConfig"
+EXCHANGE_PERMISSION = "Exchange.ManageAsApp"
+EXCHANGE_SYSTEM_MAILBOX = "SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}"
 HUNTING_PATH = "/v1.0/security/runHuntingQuery"
 # Fixed read-only KQL used only to prove ThreatHunting.Read.All works; never built from input.
 HUNTING_CHECK_BODY = {"Query": "DeviceInfo | take 1"}
@@ -81,7 +101,10 @@ LICENSED = {"DeviceManagementManagedDevices.Read.All": "Intune", "DeviceManageme
             "IdentityRiskyUser.Read.All": "Microsoft Entra ID P2",
             "IdentityRiskEvent.Read.All": "Microsoft Entra ID P2", "Sites.Read.All": "SharePoint Online",
             "ThreatHunting.Read.All": "Microsoft Defender for Endpoint",
-            "SensitivityLabel.Read": "Microsoft Purview Information Protection"}
+            "SensitivityLabel.Read": "Microsoft Purview Information Protection",
+            "DeviceManagementScripts.Read.All": "Intune",
+            "CloudApp-Discovery.Read.All": "Microsoft Defender for Cloud Apps",
+            "ExchangeMessageTrace.Read.All": "Exchange Online"}
 # Areas whose check passes on any tenant but where part of the AIO area needs a licence.
 PARTLY_LICENSED = {"AuditLog.Read.All": "sign-in logs (Sign-ins, MFA, Inactive users) also need Microsoft Entra ID P1",
                    "Reports.Read.All": "Copilot usage reports also need Microsoft 365 Copilot licences",
@@ -108,11 +131,11 @@ def post_form(url, fields):
         raise SetupError("Could not reach Microsoft sign-in; check your internet connection.") from None
 
 
-def app_token(settings):
+def app_token(settings, scope="https://graph.microsoft.com/.default"):
     """Client-credentials token for cloudshift inventory, exactly as the hosted app gets one."""
     result = post_form(f"https://login.microsoftonline.com/{settings['ENTRA_TENANT_ID']}/oauth2/v2.0/token", {
         "client_id": settings["GRAPH_CLIENT_ID"], "client_secret": settings["GRAPH_CLIENT_SECRET"],
-        "scope": "https://graph.microsoft.com/.default", "grant_type": "client_credentials"})
+        "scope": scope, "grant_type": "client_credentials"})
     token = result.get("access_token")
     if not isinstance(token, str):
         raise SetupError("Microsoft sign-in returned no token for cloudshift inventory.")
@@ -159,6 +182,72 @@ def graph_status(path, token):
         return error.code, code if isinstance(code, str) and code.replace("_", "").isalnum() else ""
     except (urllib.error.URLError, OSError):
         return 0, "NetworkError"
+
+
+def token_roles(token):
+    """Application roles in an access token (read locally from its payload; the token is never printed)."""
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        roles = claims.get("roles", [])
+        return [r for r in roles if isinstance(r, str)] if isinstance(roles, list) else []
+    except (IndexError, ValueError, AttributeError, TypeError):
+        return []
+
+
+def exchange_status(tenant_id, token):
+    """HTTP status of one fixed Get-OrganizationConfig call through Exchange Online's admin endpoint (the one
+    the ExchangeOnlineManagement module uses; not documented as a public API). Bodies are never printed and
+    redirects are never followed."""
+    tenant = identifier(tenant_id)
+    body = json.dumps({"CmdletInput": {"CmdletName": EXCHANGE_CHECK_CMDLET, "Parameters": {}}}).encode()
+    request = urllib.request.Request(
+        f"https://outlook.office365.com/adminapi/beta/{tenant}/InvokeCommand", data=body, method="POST",
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json",
+                 "Content-Type": "application/json", "X-ResponseFormat": "json",
+                 "X-AnchorMailbox": f"APP:{EXCHANGE_SYSTEM_MAILBOX}@{tenant}",
+                 "X-CmdletName": EXCHANGE_CHECK_CMDLET})
+    try:
+        with OPENER.open(request, timeout=60) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        error.close()
+        return error.code
+    except (urllib.error.URLError, OSError):
+        return 0
+
+
+def exchange_check(settings):
+    """("live" | "permission" | "role" | "failed", HTTP status) for Exchange Online read access.
+
+    "permission": the app's Exchange token carries no Exchange.ManageAsApp (not consented yet).
+    "role": the permission is there but Exchange refuses the read-only cmdlet (no Exchange role)."""
+    try:
+        token = app_token(settings, EXCHANGE_SCOPE)
+    except SetupError:
+        return "permission", 0
+    if EXCHANGE_PERMISSION not in token_roles(token):
+        return "permission", 0
+    status = exchange_status(settings["ENTRA_TENANT_ID"], token)
+    if status == 200:
+        return "live", status
+    if status == 401:
+        return "permission", status
+    if status in (400, 403, 404):
+        return "role", status
+    return "failed", status
+
+
+def explain_exchange(state, status, steps):
+    if state == "live":
+        return ["live (" + EXCHANGE_CHECK_CMDLET + " answered; role " + deployment.EXCHANGE_ROLE_GROUP + ")"]
+    if state == "permission":
+        return [f"permission missing: {EXCHANGE_PERMISSION} (Office 365 Exchange Online) is not consented "
+                "yet. Rerun this script as an admin; consent can take a few minutes."]
+    if state == "role":
+        return [f"role missing ({status}): the app has {EXCHANGE_PERMISSION} but no Exchange role. An Exchange "
+                "Administrator runs once in Exchange Online PowerShell:", *("      " + line for line in steps)]
+    return [f"failed ({status or 'network'}). Try again shortly."]
 
 
 def run_checks(settings, wait):
@@ -218,6 +307,7 @@ def main():
                          "open each area instead; nothing was changed.")
     progress = deployment.Progress((2 if args.check_only else 6) if testable else 4)
     changed = False
+    principal = None
     if not args.check_only:
         if not shutil.which("az"):
             raise SetupError("Install Microsoft's Azure CLI, then sign in with az login --tenant TENANT_ID.")
@@ -227,20 +317,29 @@ def main():
             raise SetupError("Azure CLI is signed in to a different tenant than AIO. "
                              "Run az login --tenant " + settings["ENTRA_TENANT_ID"])
         print("Signed in as " + str(account.get("user", {}).get("name", "unknown")))
-        progress.step(f"Requesting the {len(names)} read-only permissions on cloudshift inventory")
-        added = deployment.ensure_read_permissions(app_id)
+        progress.step(f"Requesting the {len(names) + len(deployment.EXCHANGE_READ_PERMISSIONS)} read-only "
+                      "permissions on cloudshift inventory")
+        added = deployment.ensure_read_permissions(app_id) + deployment.ensure_exchange_permissions(app_id)
         print("  added: " + ", ".join(added) if added else "  all already requested")
         progress.step("Granting admin consent for exactly those permissions")
         try:
-            granted = deployment.grant_read_permissions(app_id)
+            granted = deployment.grant_read_permissions(app_id) + deployment.grant_exchange_permissions(app_id)
+            principal = deployment.service_principal(app_id)
         except SetupError:
             raise SetupError("Admin consent failed. Sign in as a Global Administrator or Privileged Role "
                              "Administrator (az login --tenant " + settings["ENTRA_TENANT_ID"] + ") and rerun, "
                              "or grant it in Entra → App registrations → cloudshift inventory → API "
                              "permissions → Grant admin consent.") from None
         print("  granted: " + ", ".join(granted) if granted else "  already granted")
+        try:
+            # Documented prerequisite of Graph message trace; it grants nothing to cloudshift.
+            deployment.ensure_message_trace_principal()
+        except SetupError:
+            print("  could not add Microsoft's message trace service principal (needs an Application "
+                  "Administrator); Message Trace stays unavailable until it exists")
         changed = bool(added or granted)
     results = []
+    exchange = None
     if testable:
         progress.step("Getting an app sign-in for cloudshift inventory")
         app_token(settings)
@@ -249,6 +348,8 @@ def main():
                       "under 1 min; up to 5 min after new consent")
         # Only wait for propagation when this run changed access; otherwise a denial is the real answer.
         results = run_checks(settings, WAIT_SECONDS if changed else 0)
+        print("  checking Exchange Online with " + EXCHANGE_CHECK_CMDLET + " (read-only)", flush=True)
+        exchange = exchange_check(settings)
     elif changed:
         # No local check to wait on: give new consent time to reach the app's next token before restarting.
         print("  waiting 2 minutes for the new consent to apply before the restart", flush=True)
@@ -268,16 +369,31 @@ def main():
         print("Skipped the live check: this install uses workload identity federation and the settings file")
         print("holds no inventory client secret (the app signs in with its managed identity). Sign in to AIO")
         print("and open each area to confirm; an area missing a licence shows as unavailable there.")
+        print("Exchange Online also needs the read-only role " + deployment.EXCHANGE_ROLE_GROUP + "; if the")
+        print("Exchange areas say 'Exchange role required', an Exchange Administrator runs once in Exchange Online")
+        print("PowerShell:")
+        for line in deployment.exchange_role_steps(app_id, principal):
+            print("      " + line)
         return
     width = max(len(label) for label, *_ in results)
     for label, permission, status, code in results:
         print(f"  {'✓' if status == 200 else '✗'} {label.ljust(width)}  {explain(permission, status, code)}")
-    live = sum(status == 200 for *_, status, _ in results)
+    steps = deployment.exchange_role_steps(app_id, principal)
+    state, status = exchange
+    lines = explain_exchange(state, status, steps)
+    print(f"  {'✓' if state == 'live' else '✗'} {'Exchange Online'.ljust(width)}  {lines[0]}")
+    for line in lines[1:]:
+        print(line)
+    live = sum(status == 200 for *_, status, _ in results) + (state == "live")
+    total = len(results) + 1
     print()
-    print(f"{live} of {len(results)} areas are live.")
-    if live < len(results):
+    print(f"{live} of {total} areas are live.")
+    print("Customer tenants: consent Exchange with https://login.microsoftonline.com/<tenant-id>/adminconsent"
+          f"?client_id={app_id}&scope=https://outlook.office365.com/.default and run the same Exchange")
+    print("  PowerShell there with that tenant's object ID of cloudshift inventory.")
+    if live < total:
         print("Rerun later with --check-only to test again without changing anything.")
-    sys.exit(0 if live == len(results) else 2)
+    sys.exit(0 if live == total else 2)
 
 
 if __name__ == "__main__":

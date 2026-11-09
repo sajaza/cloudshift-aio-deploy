@@ -24,7 +24,8 @@ import threading
 import time
 import uuid
 
-from graph_permissions import GRAPH_APP_ID, READ_PERMISSIONS
+from graph_permissions import (EXCHANGE_APP_ID, EXCHANGE_READ_PERMISSIONS, EXCHANGE_ROLE_GROUP, GRAPH_APP_ID,
+                               MESSAGE_TRACE_APP_ID, READ_PERMISSIONS)
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "infra" / "main.bicep"
@@ -418,23 +419,27 @@ def deploy(group, settings, name, deployer_id, image="", domain=None, certificat
     return {key: value.get("value") for key, value in outputs.items()}
 
 
-def graph_role_ids(app_roles, names=READ_PERMISSIONS):
+RESOURCE_NAMES = {GRAPH_APP_ID: "Microsoft Graph", EXCHANGE_APP_ID: "Office 365 Exchange Online"}
+
+
+def graph_role_ids(app_roles, names=READ_PERMISSIONS, resource=GRAPH_APP_ID):
     roles = {}
     for name in names:
         matches = [r for r in app_roles if r.get("value") == name and r.get("isEnabled")
                    and "Application" in r.get("allowedMemberTypes", [])]
         if len(matches) != 1:
-            raise SetupError("Microsoft Graph application permission unavailable: " + name)
+            raise SetupError(RESOURCE_NAMES[resource] + " application permission unavailable: " + name)
         roles[name] = identifier(matches[0]["id"])
     return roles
 
 
-def merged_access(existing, roles):
-    """Add missing Graph roles to requiredResourceAccess. Never removes or changes other entries."""
+def merged_access(existing, roles, resource=GRAPH_APP_ID):
+    """Add missing roles of one resource API (Graph by default) to requiredResourceAccess. Never removes or
+    changes other entries."""
     access = json.loads(json.dumps(existing or []))
-    graph = next((entry for entry in access if entry.get("resourceAppId") == GRAPH_APP_ID), None)
+    graph = next((entry for entry in access if entry.get("resourceAppId") == resource), None)
     if graph is None:
-        graph = {"resourceAppId": GRAPH_APP_ID, "resourceAccess": []}
+        graph = {"resourceAppId": resource, "resourceAccess": []}
         access.append(graph)
     present = {item.get("id") for item in graph.setdefault("resourceAccess", []) if item.get("type") == "Role"}
     added = []
@@ -450,11 +455,18 @@ def ensure_read_permissions(app_id):
     return ensure_permissions(app_id, READ_PERMISSIONS)
 
 
-def ensure_permissions(app_id, names):
-    """Make the app request these Graph application roles (add-only). Returns the names added."""
-    roles = graph_role_ids(cli(["ad", "sp", "show", "--id", GRAPH_APP_ID]).get("appRoles", []), names)
+def ensure_exchange_permissions(app_id):
+    """Make the inventory app request Exchange.ManageAsApp on Office 365 Exchange Online (add-only). It only
+    lets the app call Exchange Online; its Exchange role (View-Only Organization Management) decides what it
+    can do there. Returns the names added."""
+    return ensure_permissions(app_id, EXCHANGE_READ_PERMISSIONS, EXCHANGE_APP_ID)
+
+
+def ensure_permissions(app_id, names, resource=GRAPH_APP_ID):
+    """Make the app request these application roles of one resource API (add-only). Returns the names added."""
+    roles = graph_role_ids(cli(["ad", "sp", "show", "--id", resource]).get("appRoles", []), names, resource)
     current = cli(["ad", "app", "show", "--id", app_id]).get("requiredResourceAccess", [])
-    access, added = merged_access(current, roles)
+    access, added = merged_access(current, roles, resource)
     if added:
         with tempfile.TemporaryDirectory(prefix="cloudshift-deploy-") as directory:
             body = private_temp(directory, "body.json", json.dumps({"requiredResourceAccess": access}))
@@ -462,6 +474,26 @@ def ensure_permissions(app_id, names):
                  "--url", f"https://graph.microsoft.com/v1.0/applications(appId='{identifier(app_id)}')",
                  "--headers", "Content-Type=application/json", "--body", "@" + str(body)])
     return added
+
+
+def exchange_role_steps(app_id, principal_id=None):
+    """Exact Exchange Online PowerShell an Exchange Administrator runs once per tenant to give the inventory
+    app read-only Exchange access. Exchange role groups cannot be changed through Microsoft Graph, so this is
+    printed, never run. Only IDs are printed (no secrets). Without principal_id (another tenant, or no Azure
+    CLI sign-in) the enterprise application's object ID is left as a placeholder."""
+    app = identifier(app_id)
+    principal = identifier(principal_id) if principal_id else "<object ID of cloudshift inventory in Entra → Enterprise applications>"
+    return [
+        "Connect-ExchangeOnline   # as an Exchange Administrator of this tenant (module ExchangeOnlineManagement)",
+        f'New-ServicePrincipal -AppId {app} -ObjectId {principal} -DisplayName "cloudshift inventory"',
+        f'Add-RoleGroupMember -Identity "{EXCHANGE_ROLE_GROUP}" -Member {principal}',
+        "# Narrower alternative to the role group (same read-only roles, assigned directly):",
+        f'#   New-ManagementRoleAssignment -App {principal} -Role "View-Only Configuration"',
+        f'#   New-ManagementRoleAssignment -App {principal} -Role "View-Only Recipients"',
+        "# To undo later:",
+        f'#   Remove-RoleGroupMember -Identity "{EXCHANGE_ROLE_GROUP}" -Member {principal}',
+        f"#   Remove-ServicePrincipal -Identity {principal}",
+    ]
 
 
 def service_principal(app_id):
@@ -478,12 +510,25 @@ def grant_read_permissions(app_id):
     return grant_app_roles(app_id, READ_PERMISSIONS)
 
 
-def grant_app_roles(app_id, names):
-    """Admin-consent exactly these Graph application roles, one appRoleAssignment each; nothing else is
-    consented or removed. Needs Global or Privileged Role Administrator. Returns the names newly granted."""
-    graph = cli(["ad", "sp", "show", "--id", GRAPH_APP_ID])
+def grant_exchange_permissions(app_id):
+    """Admin-consent Exchange.ManageAsApp (Office 365 Exchange Online) for the inventory app. Returns the
+    names newly granted. The Exchange role itself is a separate, Exchange-side step (see exchange_role_steps)."""
+    return grant_app_roles(app_id, EXCHANGE_READ_PERMISSIONS, EXCHANGE_APP_ID)
+
+
+def ensure_message_trace_principal():
+    """Graph message trace needs Microsoft's message trace service principal in the tenant (documented
+    prerequisite). Creates it if missing; it grants nothing to cloudshift. Returns its object ID."""
+    return service_principal(MESSAGE_TRACE_APP_ID)
+
+
+def grant_app_roles(app_id, names, resource=GRAPH_APP_ID):
+    """Admin-consent exactly these application roles of one resource API (Graph by default), one
+    appRoleAssignment each; nothing else is consented or removed. Needs Global or Privileged Role
+    Administrator. Returns the names newly granted."""
+    graph = cli(["ad", "sp", "show", "--id", resource])
     graph_id = identifier(graph.get("id"))
-    roles = graph_role_ids(graph.get("appRoles", []), names)
+    roles = graph_role_ids(graph.get("appRoles", []), names, resource)
     principal = service_principal(app_id)
     url = f"https://graph.microsoft.com/v1.0/servicePrincipals/{principal}/appRoleAssignments"
     current = cli(["rest", "--method", "GET", "--url", url]).get("value", [])
@@ -758,7 +803,9 @@ def plan(args):
     print("Ask for a custom web address (or use --domain); show its CNAME/TXT records, bind a free managed")
     print("  certificate, and keep that domain on every later redeploy.")
     print("Add https://<app address>" + CALLBACK + " to cloudshift operators; keep existing redirects.")
-    print(f"Add any of the {len(READ_PERMISSIONS)} read-only Graph permissions cloudshift inventory is missing; never remove any.")
+    print(f"Add any of the {len(READ_PERMISSIONS)} read-only Graph permissions and {EXCHANGE_READ_PERMISSIONS[0]} (Office 365")
+    print("  Exchange Online) that cloudshift inventory is missing; never remove any. Its Exchange role is a")
+    print("  separate Exchange PowerShell step that grant-permissions.py prints.")
     print("With --grant-consent, admin-consent exactly those permissions before the app starts.")
     print("If the configuration has " + OPERATOR_GROUP + ", members of that Entra group may also sign in.")
     print("With --federation (kept once used): add the federated identity credential " + FIC_NAME + " (issuer")
@@ -874,18 +921,21 @@ def main():
             print(f"  cloudshift {app}: {FIC_NAME} {outcome}")
         print("  new trusts can take a few minutes to apply; early Microsoft requests may fail meanwhile")
     # Before the app starts, so its first Graph token already carries every role.
-    progress.step(f"Giving cloudshift inventory its {len(READ_PERMISSIONS)} read-only permissions", "under 1 min")
+    progress.step(f"Giving cloudshift inventory its {len(READ_PERMISSIONS) + len(EXCHANGE_READ_PERMISSIONS)} "
+                  "read-only permissions", "under 1 min")
     consented = permissions_ok = False
     added = []
     try:
-        added = ensure_read_permissions(settings["GRAPH_CLIENT_ID"])
+        added = (ensure_read_permissions(settings["GRAPH_CLIENT_ID"])
+                 + ensure_exchange_permissions(settings["GRAPH_CLIENT_ID"]))
         permissions_ok = True
         print("  added: " + ", ".join(added) if added else "  all permissions already requested")
     except SetupError:
         print("  could not update the app registration with this account; add them in the portal (below)")
     if args.grant_consent:
         try:
-            granted = grant_read_permissions(settings["GRAPH_CLIENT_ID"])
+            granted = (grant_read_permissions(settings["GRAPH_CLIENT_ID"])
+                       + grant_exchange_permissions(settings["GRAPH_CLIENT_ID"]))
             consented = True
             print("  granted admin consent: " + ", ".join(granted) if granted else "  admin consent already granted")
         except SetupError:
@@ -930,11 +980,14 @@ def main():
     if not permissions_ok:
         print("Entra → App registrations → cloudshift inventory → API permissions: add these Microsoft Graph")
         print("  application permissions: " + ", ".join(READ_PERMISSIONS))
+        print("  and Office 365 Exchange Online application permission: " + ", ".join(EXCHANGE_READ_PERMISSIONS))
     if not consented:
         lead = "New permissions need" if added or not permissions_ok else "If you have not already, grant"
         print(f"{lead} admin consent: Entra → App registrations → cloudshift inventory → API permissions")
         print("  → Grant admin consent, then restart the app (Container App → Revisions → Restart).")
         print("  Or rerun this command with --grant-consent as a Global or Privileged Role Administrator.")
+    print("Exchange Online blades also need the read-only Exchange role " + EXCHANGE_ROLE_GROUP + ";")
+    print("  run scripts/grant-permissions.py to check it and print the exact Exchange PowerShell steps.")
     if federated(settings):
         print("cloudshift inventory uses workload identity federation: the app holds no inventory client secret.")
         if not args.remove_secrets:
