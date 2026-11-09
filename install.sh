@@ -35,7 +35,7 @@ consent=()
 federation=()
 [[ "${CLOUDSHIFT_FEDERATION:-false}" == "true" ]] && federation=(--federation)
 echo "AIO reads users, groups, devices, sign-ins, roles, apps, Intune, Defender, Secure Score, SharePoint,"
-echo "usage reports, Microsoft 365 health and Exchange Online settings, with 35 read-only permissions (34 Microsoft Graph,"
+echo "usage reports, Microsoft 365 health and Exchange Online settings, with 33 read-only permissions (32 Microsoft Graph,"
 echo "1 Exchange Online). It cannot change anything; Exchange also needs a View-Only role that grant-permissions.py explains."
 read -rp "Grant admin consent for that now? Needs Global Administrator or Privileged Role Administrator. [Y/n] " answer
 [[ "$answer" =~ ^[Nn]$ ]] || consent=(--grant-consent)

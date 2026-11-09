@@ -10,6 +10,8 @@ hosted app so it uses the new access. Exchange also needs a read-only Exchange r
 missing, the script prints the exact commands instead. Never prints credential values. Python standard
 library only.
 Run --check-only to only test, without changing anything.
+Defender advanced hunting (ThreatHunting.Read.All, used by the two Vulnerabilities blades) is opt-in:
+add --enable-defender-hunting to consent it, or --disable-defender-hunting to remove it.
 An install using workload identity federation whose inventory client secret was removed cannot be tested
 from here (only the Container App's managed identity can sign in as cloudshift inventory); the script
 then requests, consents and restarts, and the areas are checked in AIO itself.
@@ -75,7 +77,6 @@ CHECKS = (
     ("BitLocker key IDs", "BitlockerKey.ReadBasic.All", "/v1.0/informationProtection/bitlocker/recoveryKeys"),
     ("Teams phone numbers", "TeamsTelephoneNumber.Read.All",
      "/v1.0/admin/teams/telephoneNumberManagement/numberAssignments?$top=1"),
-    ("Teams user configuration", "TeamsUserConfiguration.Read.All", "/v1.0/admin/teams/userConfigurations?$top=1"),
     # Delivery metadata of the last 48 hours; needs Microsoft's message trace service principal (created below).
     ("Message trace", "ExchangeMessageTrace.Read.All", "/v1.0/admin/exchange/tracing/messageTraces?$top=1"),
     # Preview blades: only a Graph beta API exists (see src/lib/modules/graph-beta.ts). Never scriptContent.
@@ -105,6 +106,9 @@ LICENSED = {"DeviceManagementManagedDevices.Read.All": "Intune", "DeviceManageme
             "DeviceManagementScripts.Read.All": "Intune",
             "CloudApp-Discovery.Read.All": "Microsoft Defender for Cloud Apps",
             "ExchangeMessageTrace.Read.All": "Exchange Online"}
+# Permissions AIO never requests by default; the check reports them as off until enabled.
+OPT_IN = {"ThreatHunting.Read.All": "Vulnerabilities and Vulnerability Report need it; it allows any Defender "
+          "advanced hunting query, so add it per tenant with --enable-defender-hunting."}
 # Areas whose check passes on any tenant but where part of the AIO area needs a licence.
 PARTLY_LICENSED = {"AuditLog.Read.All": "sign-in logs (Sign-ins, MFA, Inactive users) also need Microsoft Entra ID P1",
                    "Reports.Read.All": "Copilot usage reports also need Microsoft 365 Copilot licences",
@@ -256,7 +260,8 @@ def run_checks(settings, wait):
     while True:
         token = app_token(settings)
         results = [(label, permission, *graph_status(path, token)) for label, permission, path in CHECKS]
-        denied = [r for r in results if r[2] in (401, 403)]
+        # Opt-in areas are expected to be denied until enabled; don't wait on them.
+        denied = [r for r in results if r[2] in (401, 403) and r[1] not in OPT_IN]
         if not denied or time.monotonic() >= deadline:
             return results
         print(f"  {len(denied)} area(s) not live yet; Microsoft can take a few minutes. Retrying in 30s…",
@@ -265,6 +270,8 @@ def run_checks(settings, wait):
 
 
 def explain(permission, status, code):
+    if status in (401, 403) and permission in OPT_IN:
+        return f"off (opt-in). {OPT_IN[permission]}"
     if status == 200:
         return "live; " + PARTLY_LICENSED[permission] if permission in PARTLY_LICENSED else "live"
     if status in (401, 403) and permission in LICENSED:
@@ -294,7 +301,14 @@ def main():
     parser.add_argument("--resource-group", default="cloudshift-rg")
     parser.add_argument("--name", default="cloudshift", help="Container App name")
     parser.add_argument("--check-only", action="store_true", help="Only test access; change nothing")
+    hunting = parser.add_mutually_exclusive_group()
+    hunting.add_argument("--enable-defender-hunting", action="store_true",
+                         help="Opt in: also request and consent ThreatHunting.Read.All (Vulnerabilities blades)")
+    hunting.add_argument("--disable-defender-hunting", action="store_true",
+                         help="Remove ThreatHunting.Read.All consent and request from cloudshift inventory")
     args = parser.parse_args()
+    if args.check_only and (args.enable_defender_hunting or args.disable_defender_hunting):
+        raise SetupError("--check-only changes nothing; drop it to enable or disable Defender hunting.")
     settings = deployment.load_settings(args.env_file)
     app_id = settings["GRAPH_CLIENT_ID"]
     names = deployment.READ_PERMISSIONS
@@ -320,6 +334,11 @@ def main():
         progress.step(f"Requesting the {len(names) + len(deployment.EXCHANGE_READ_PERMISSIONS)} read-only "
                       "permissions on cloudshift inventory")
         added = deployment.ensure_read_permissions(app_id) + deployment.ensure_exchange_permissions(app_id)
+        # Never leave an opt-in permission requested: the multitenant registration's admin-consent link would
+        # then grant it in every customer tenant that consents. Existing consent here is not touched.
+        unrequested = deployment.remove_requested(app_id, deployment.HUNTING_PERMISSIONS)
+        if unrequested:
+            print("  no longer requested by default (opt-in): " + ", ".join(unrequested))
         print("  added: " + ", ".join(added) if added else "  all already requested")
         progress.step("Granting admin consent for exactly those permissions")
         try:
@@ -331,6 +350,18 @@ def main():
                              "or grant it in Entra → App registrations → cloudshift inventory → API "
                              "permissions → Grant admin consent.") from None
         print("  granted: " + ", ".join(granted) if granted else "  already granted")
+        if args.enable_defender_hunting:
+            # Consented in this tenant only (an appRoleAssignment needs no requiredResourceAccess entry), so a
+            # customer tenant's admin-consent link never includes it.
+            hunting_granted = deployment.grant_app_roles(app_id, deployment.HUNTING_PERMISSIONS)
+            print("  Defender hunting (opt-in, this tenant only): " + ("enabled" if hunting_granted
+                                                                     else "already enabled"))
+            granted = granted + hunting_granted
+        elif args.disable_defender_hunting:
+            revoked = deployment.revoke_app_roles(app_id, deployment.HUNTING_PERMISSIONS)
+            print("  Defender hunting: " + ("consent removed" if revoked else "was not consented")
+                  + "; Vulnerabilities blades now show a permission message")
+            granted = granted + revoked
         try:
             # Documented prerequisite of Graph message trace; it grants nothing to cloudshift.
             deployment.ensure_message_trace_principal()
@@ -388,9 +419,15 @@ def main():
     total = len(results) + 1
     print()
     print(f"{live} of {total} areas are live.")
-    print("Customer tenants: consent Exchange with https://login.microsoftonline.com/<tenant-id>/adminconsent"
-          f"?client_id={app_id}&scope=https://outlook.office365.com/.default and run the same Exchange")
-    print("  PowerShell there with that tenant's object ID of cloudshift inventory.")
+    print("Customer tenants: a Global Administrator there opens https://login.microsoftonline.com/<tenant-id>/"
+          f"adminconsent?client_id={app_id}")
+    print("  This consents every permission cloudshift inventory requests (Microsoft Graph and Exchange, all")
+    print("  read-only), not only Exchange. Then run the same Exchange PowerShell there with that tenant's")
+    print("  object ID of cloudshift inventory.")
+    print("  Defender hunting is never part of that consent. To opt a customer tenant in, its administrator")
+    print("  runs (Microsoft Graph PowerShell, in that tenant):")
+    for line in deployment.opt_in_role_steps(app_id, deployment.HUNTING_ROLE_ID):
+        print("      " + line)
     if live < total:
         print("Rerun later with --check-only to test again without changing anything.")
     sys.exit(0 if live == total else 2)

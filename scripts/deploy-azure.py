@@ -25,7 +25,10 @@ import time
 import uuid
 
 from graph_permissions import (EXCHANGE_APP_ID, EXCHANGE_READ_PERMISSIONS, EXCHANGE_ROLE_GROUP, GRAPH_APP_ID,
-                               MESSAGE_TRACE_APP_ID, READ_PERMISSIONS)
+                               HUNTING_PERMISSIONS, HUNTING_ROLE_ID, MESSAGE_TRACE_APP_ID, READ_PERMISSIONS)
+# HUNTING_PERMISSIONS is opt-in: grant-permissions.py consents or revokes it on request; the deploy never does.
+OPT_IN_PERMISSIONS = HUNTING_PERMISSIONS
+OPT_IN_ROLE_IDS = {HUNTING_PERMISSIONS[0]: HUNTING_ROLE_ID}
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "infra" / "main.bicep"
@@ -546,6 +549,84 @@ def grant_app_roles(app_id, names, resource=GRAPH_APP_ID):
     return granted
 
 
+def assignment_id(value):
+    """appRoleAssignment IDs are URL-safe base64 strings, not UUIDs; refuse anything else in a URL."""
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{20,80}", value):
+        return value
+    raise SetupError("Unexpected app role assignment ID; nothing was removed.")
+
+
+def remove_requested(app_id, names, resource=GRAPH_APP_ID):
+    """Stop the app registration requesting these application roles (opt-in permissions only). The
+    registration is multitenant, and an admin-consent link consents everything it requests in that customer
+    tenant, so an opt-in permission must never stay in requiredResourceAccess. Existing consent (an
+    appRoleAssignment) is not touched. Returns the names removed from the request."""
+    roles = graph_role_ids(cli(["ad", "sp", "show", "--id", resource]).get("appRoles", []), names, resource)
+    by_id = {role_id: name for name, role_id in roles.items()}
+    requested = cli(["ad", "app", "show", "--id", app_id]).get("requiredResourceAccess", [])
+    access = json.loads(json.dumps(requested or []))
+    removed = []
+    for entry in access:
+        if entry.get("resourceAppId") != resource:
+            continue
+        kept = []
+        for item in entry.get("resourceAccess", []):
+            role_id = str(item.get("id")).lower()
+            if item.get("type") == "Role" and role_id in by_id:
+                removed.append(by_id[role_id])
+            else:
+                kept.append(item)
+        entry["resourceAccess"] = kept
+    if removed:
+        with tempfile.TemporaryDirectory(prefix="cloudshift-deploy-") as directory:
+            body = private_temp(directory, "body.json", json.dumps({"requiredResourceAccess": access}))
+            cli(["rest", "--method", "PATCH",
+                 "--url", f"https://graph.microsoft.com/v1.0/applications(appId='{identifier(app_id)}')",
+                 "--headers", "Content-Type=application/json", "--body", "@" + str(body)])
+    return sorted(set(removed))
+
+
+def revoke_app_roles(app_id, names, resource=GRAPH_APP_ID):
+    """Remove the admin consent (appRoleAssignment) for exactly these application roles in this tenant.
+    Used only for opt-in permissions; nothing else is touched. Returns the names revoked."""
+    graph = cli(["ad", "sp", "show", "--id", resource])
+    graph_id = identifier(graph.get("id"))
+    roles = graph_role_ids(graph.get("appRoles", []), names, resource)
+    by_id = {role_id: name for name, role_id in roles.items()}
+    principal = service_principal(app_id)
+    url = f"https://graph.microsoft.com/v1.0/servicePrincipals/{principal}/appRoleAssignments"
+    # Fail closed: a later page could hold the assignment, and "not consented" must never be a guess.
+    response = cli(["rest", "--method", "GET", "--url", url + "?$top=999"])
+    if response.get("@odata.nextLink"):
+        raise SetupError("Too many app role assignments to check in one page; nothing was removed.")
+    current = response.get("value", [])
+    revoked = []
+    for item in current:
+        role_id = str(item.get("appRoleId")).lower()
+        if item.get("resourceId") == graph_id and role_id in by_id:
+            cli(["rest", "--method", "DELETE", "--url", f"{url}/{assignment_id(item.get('id'))}"])
+            revoked.append(by_id[role_id])
+    return sorted(set(revoked))
+
+
+def opt_in_role_steps(app_id, role_id):
+    """Microsoft Graph PowerShell a customer tenant's administrator runs to consent (or remove) one opt-in
+    application role for cloudshift inventory in their own tenant. Printed, never run; IDs only."""
+    app, role = identifier(app_id), identifier(role_id)
+    return [
+        'Connect-MgGraph -Scopes "AppRoleAssignment.ReadWrite.All","Application.Read.All"   # in that tenant',
+        f"$sp = Get-MgServicePrincipal -Filter \"appId eq '{app}'\"",
+        f"$graph = Get-MgServicePrincipal -Filter \"appId eq '{GRAPH_APP_ID}'\"",
+        "New-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -PrincipalId $sp.Id "
+        f"-ResourceId $graph.Id -AppRoleId {role}",
+        "# To remove it again:",
+        "#   Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id |",
+        f"#     Where-Object AppRoleId -eq '{role}' |",
+        "#     ForEach-Object { Remove-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id "
+        "-AppRoleAssignmentId $_.Id }",
+    ]
+
+
 def secret_names(settings):
     """Key Vault secret name -> setting, with no secret for an app that uses workload identity
     federation. Add user needs no secret of its own."""
@@ -928,6 +1009,8 @@ def main():
     try:
         added = (ensure_read_permissions(settings["GRAPH_CLIENT_ID"])
                  + ensure_exchange_permissions(settings["GRAPH_CLIENT_ID"]))
+        # Opt-in permissions must never be requested by the multitenant registration (see remove_requested).
+        remove_requested(settings["GRAPH_CLIENT_ID"], OPT_IN_PERMISSIONS)
         permissions_ok = True
         print("  added: " + ", ".join(added) if added else "  all permissions already requested")
     except SetupError:

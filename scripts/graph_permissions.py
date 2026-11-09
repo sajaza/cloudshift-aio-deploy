@@ -34,17 +34,28 @@ READ_PERMISSIONS = (
     # Wave 4 blades
     "CrossTenantInformation.ReadBasic.All",     # Partner Relationships (organisation names)
     "ConfigurationMonitoring.Read.All",         # Standards & Drift (Microsoft configuration drift)
-    "ThreatHunting.Read.All",                   # Vulnerabilities, Vulnerability Report (fixed hunting queries)
     "SensitivityLabel.Read",                    # Sensitivity Labels
     "AppCatalog.Read.All",                      # Agent365 Packages (org Teams app catalogue)
     "BitlockerKey.ReadBasic.All",               # BitLocker Key Search (key IDs only, never the key)
     "TeamsTelephoneNumber.Read.All",            # Business Voice (phone numbers)
-    "TeamsUserConfiguration.Read.All",          # Business Voice (who a number is assigned to)
     # Wave 3 blades
     "ExchangeMessageTrace.Read.All",            # Message Trace (Graph v1.0; delivery metadata, no subjects shown)
     "DeviceManagementScripts.Read.All",         # Scripts (Graph beta Preview; names/settings, never script content)
     "CloudApp-Discovery.Read.All",              # Shadow AI Discovery (Graph beta Preview; Defender for Cloud Apps)
 )
+
+# Opt-in only: ThreatHunting.Read.All lets the app run any advanced hunting query over a tenant's Defender
+# XDR data, although AIO runs only two fixed vulnerability queries (Vulnerabilities, Vulnerability Report).
+# It is never in the registration's requested permissions (the registration is multitenant, and an
+# admin-consent link consents everything requested), only consented directly per tenant: AIO's own tenant
+# with grant-permissions.py --enable-defender-hunting (--disable-defender-hunting removes it), a customer
+# tenant by its administrator with the Graph PowerShell that grant-permissions.py prints.
+HUNTING_PERMISSIONS = (
+    "ThreatHunting.Read.All",
+)
+# Microsoft Graph's app role ID for ThreatHunting.Read.All (the same in every tenant); used only in the
+# printed customer-tenant steps. The home tenant resolves role IDs from Graph itself.
+HUNTING_ROLE_ID = "dd98c7f5-2d42-42d3-a0e4-633161547251"
 
 # Office 365 Exchange Online (the resource for https://outlook.office365.com). Exchange.ManageAsApp only
 # lets the app call Exchange Online app-only; what it can do there is decided solely by the Exchange role
