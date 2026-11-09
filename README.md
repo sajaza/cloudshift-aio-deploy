@@ -29,6 +29,7 @@ It takes about 15 minutes, most of it waiting while a progress bar shows each st
    | Company name         | Press Enter to accept, or type the name to show in AIO              |
    | Azure region         | Press Enter for `eastus`, or e.g. `uksouth`, `westeurope`           |
    | Grant admin consent? | Press Enter (yes) if you are a Global/Privileged Role Administrator |
+   | Entra group          | Press Enter to skip, or a group name or object ID (see below)       |
    | Image pull token     | Paste the `ghp_…` token (it stays hidden) and press Enter           |
    | Custom web address   | Press Enter for the generic address, or type your own (see below)   |
 
@@ -37,10 +38,20 @@ It takes about 15 minutes, most of it waiting while a progress bar shows each st
 
 ## What it creates
 
-- Two app registrations in Entra: **cloudshift operators** (sign-in only) and **cloudshift inventory** (10 read-only Microsoft Graph permissions: users, devices, licences, Conditional Access, Intune devices and apps, Defender incidents, Microsoft 365 organisation, domains and service health).
+- Two app registrations in Entra: **cloudshift operators** (sign-in only) and **cloudshift inventory** (23 read-only Microsoft Graph permissions: users, groups, devices, licences, Conditional Access, sign-in and audit logs, identity risk, directory roles, applications and consent requests, Intune devices, apps, policies and Autopilot, Defender incidents and alerts, Secure Score, SharePoint sites, Microsoft 365 usage reports, organisation, domains and service health). They can only read. Exchange Online, Teams and other workloads are not part of this consent: Exchange data today comes only from an optional export you run and import yourself, and any live access to them would come later as a separate, opt-in step with its own consent.
 - A resource group **cloudshift-rg** with the AIO container, a private container registry, a Key Vault holding the secrets, a managed identity and a log workspace.
 
-Secrets are never shown on screen. They live in Key Vault and in a private file in your Cloud Shell storage (`cloudshift-aio-deploy/.env.entra.generated`), which an install retry reuses. Client secrets expire after 180 days.
+Secrets are never shown on screen. They live in Key Vault and in a private file in your Cloud Shell storage (`cloudshift-aio-deploy/.env.entra.generated`), which an install retry reuses; anyone who can read your Cloud Shell storage account can read it, so keep that storage account private. `.env.registration-state.json` next to it keeps the app IDs. Client secrets expire after 180 days. To host without the inventory app's client secret, start the installer with `CLOUDSHIFT_FEDERATION=true bash install.sh` (see [No secrets](AZURE-HOSTING.md#no-secrets-workload-identity-federation)).
+
+## Limit AIO to a group (optional)
+
+To let a team use AIO, and lock people out again by removing them from a group:
+
+1. In **entra.microsoft.com → Groups → New group**, create a **Security** group such as `AIO operators`. Add **yourself first**, then the others.
+2. **Enterprise applications → cloudshift operators → Properties → Assignment required? → Yes → Save**, then **Users and groups → Add user/group** → the group → **Assign**. (Needs Entra ID P1 or P2; members of nested groups aren't covered by this assignment, so add people to the group directly.)
+3. Run the installer again and answer **Entra group whose members may use AIO** with the group's name or object ID.
+
+Members, including nested ones, are checked at sign-in and again every 10 minutes or so. If Microsoft can't be reached, group members are refused, but the account that ran the installer still gets in. Details: [AZURE-HOSTING.md](AZURE-HOSTING.md#limit-aio-to-a-group-optional).
 
 ## Use your own web address (optional)
 
@@ -55,6 +66,14 @@ Instead of the generic `https://cloudshift.<random>.<region>.azurecontainerapps.
 4. Azure issues a free certificate that renews itself. AIO switches to your address; the generic address keeps working as a backup.
 
 Later updates keep your address automatically (press Enter at the question). To go back to the generic address, type `generic`. It must be a subdomain like `aio.contoso.com`; a bare domain like `contoso.com` can't be used.
+
+## Install a specific version (optional)
+
+The line above installs the newest published AIO (`latest`), and every rerun updates to the newest again. To control when AIO changes, ask for a version tag (a long commit ID) and install or rerun with it:
+
+```sh
+CLOUDSHIFT_IMAGE=ghcr.io/sajaza/cloudshift-aio:<version> bash cloudshift-aio-deploy/install.sh
+```
 
 ## If something goes wrong
 

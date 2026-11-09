@@ -61,6 +61,15 @@ AVD_FLAG = "CLOUDSHIFT_ENABLE_AVD"
 # Features the hosted template does not configure yet; a local-only setting is ignored, not copied.
 UNSUPPORTED = ("CLOUDSHIFT_GDAP_DISCOVERY", "CLOUDSHIFT_PARTNER_DISCOVERY", "CLOUDSHIFT_ENABLE_DEPLOYMENTS")
 CALLBACK = "/api/auth/callback/azure-ad"
+# Local-development sign-in redirect that register-entra.py adds without --for-hosting. A hosted install
+# drops it from cloudshift operators: an authorization code sent to a localhost listener on an operator's
+# machine is not something production sign-in should accept. Local development uses its own registration.
+LOCAL_REDIRECT = "http://localhost:3000" + CALLBACK
+# Display name register-entra.py gives the client secrets it creates; --remove-secrets deletes only these
+# unless --all-credentials is passed.
+AIO_SECRET_NAME = "cloudshift local setup"
+# Resume file written by register-entra.py next to the settings file; --remove-secrets scrubs secret values.
+STATE_FILE = ".env.registration-state.json"
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,22}[a-z0-9]$")
 
 
@@ -228,7 +237,8 @@ def template_parameters(settings, name, deployer_id, image="", domain=None, cert
 
 
 def merged_redirects(existing, *app_urls):
-    redirects = list(existing)
+    """Existing redirect URIs plus the hosted callbacks; the local-development URI is dropped (hosted only)."""
+    redirects = [uri for uri in existing if uri != LOCAL_REDIRECT]
     for app_url in app_urls:
         target = app_url.rstrip("/") + CALLBACK
         if not target.startswith("https://"):
@@ -588,23 +598,70 @@ def write_setting(path, key, value):
             os.unlink(temporary)
 
 
-def remove_inventory_secrets(app_id, vault, env_path, confirm=None):
-    """Opt-in only (--remove-secrets): delete every client secret of the inventory app, its Key Vault
-    secret (soft-deleted, recoverable for 30 days) and its line in the settings file. Other apps'
-    credentials, certificates and federated identity credentials are never touched."""
+def scrub_registration_state(env_path):
+    """Drop every secret value (client secrets and the session secret) from register-entra.py's resume
+    file next to env_path; app IDs and secret key IDs stay. Call it only while env_path holds the secrets
+    still in use (load_settings requires NEXTAUTH_SECRET and ENTRA_CLIENT_SECRET). True if it changed."""
+    path = env_path.parent / STATE_FILE
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        print(f"  could not read {STATE_FILE}; delete it once you no longer need to rerun register-entra.py")
+        return False
+    if not isinstance(state, dict):
+        return False
+    changed = state.pop("session_secret", None) is not None
+    for record in (state.get("apps") or {}).values():
+        if isinstance(record, dict) and "secret" in record:
+            del record["secret"]
+            changed = True
+    if not changed:
+        return False
+    fd, temporary = tempfile.mkstemp(prefix=".env.deploy-", dir=path.parent)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, indent=2) + "\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return True
+
+
+def remove_inventory_secrets(app_id, vault, env_path, confirm=None, all_credentials=False, assume_yes=False):
+    """Opt-in only (--remove-secrets): delete the inventory app's client secrets that AIO created (display
+    name AIO_SECRET_NAME; every password credential with all_credentials), its Key Vault secret
+    (soft-deleted, recoverable for 30 days), its line in the settings file and its value in the resume
+    file. Other apps' credentials, certificates and federated identity credentials are never touched.
+    Without a terminal it refuses unless assume_yes (--yes-remove-secrets) was given."""
     app_id = identifier(app_id)
     kv_secret, setting, _ = APP_SECRETS["inventory"]
-    credentials = [item for item in cli(["ad", "app", "credential", "list", "--id", app_id]) or []
-                   if isinstance(item, dict) and item.get("keyId")]
+    listed = [item for item in cli(["ad", "app", "credential", "list", "--id", app_id]) or []
+              if isinstance(item, dict) and item.get("keyId")]
+    credentials = [item for item in listed if all_credentials or item.get("displayName") == AIO_SECRET_NAME]
+    kept = [item for item in listed if item not in credentials]
     print("  WARNING: this deletes the cloudshift inventory app's client secrets. Afterwards only workload")
     print("  identity federation can authenticate it; rolling back needs a new client secret.")
     for item in credentials:
         print(f"    secret {identifier(item['keyId'])}  {item.get('displayName') or '(no name)'}  "
               f"expires {item.get('endDateTime') or 'unknown'}")
+    if kept:
+        print(f"  Keeping {len(kept)} client secret(s) AIO did not create (pass --all-credentials to delete them):")
+        for item in kept:
+            print(f"    secret {identifier(item['keyId'])}  {item.get('displayName') or '(no name)'}")
     print(f"    Key Vault secret {kv_secret} in {vault}, and {setting} in {env_path.name}")
     if confirm is None:
-        confirm = (lambda: input("  Type remove to delete them: ").strip() == "remove") if sys.stdin.isatty() \
-            else (lambda: True)
+        if sys.stdin.isatty():
+            confirm = lambda: input("  Type remove to delete them: ").strip() == "remove"  # noqa: E731
+        elif assume_yes:
+            confirm = lambda: True  # noqa: E731
+        else:
+            raise SetupError("--remove-secrets needs a terminal to confirm. To run it without one, add "
+                             "--yes-remove-secrets; nothing was removed.")
     if not confirm():
         print("  nothing was removed")
         return []
@@ -619,6 +676,9 @@ def remove_inventory_secrets(app_id, vault, env_path, confirm=None):
         print(f"  {kv_secret} was not in Key Vault")
     write_setting(env_path, setting, None)
     print(f"  removed {len(removed)} client secret(s), {kv_secret} and {setting}")
+    # The settings file still holds the two secrets in use, so the resume file need not keep any copy.
+    if scrub_registration_state(env_path):
+        print(f"  removed the stored secret values from {STATE_FILE} (app IDs are kept)")
     return removed
 
 
@@ -706,7 +766,10 @@ def plan(args):
     print("  audience " + FIC_AUDIENCE + ") to cloudshift inventory and cloudshift operators; do not upload")
     print("  graph-client-secret and do not reference it from the app. --no-federation goes back to the secret.")
     print("With --remove-secrets (an install already running federated): list, confirm, then delete only the")
-    print("  inventory app's client secrets and the graph-client-secret Key Vault secret. Never automatic.")
+    print("  inventory app's client secrets named '" + AIO_SECRET_NAME + "' (--all-credentials: all of them) and")
+    print("  the graph-client-secret Key Vault secret. Never automatic: needs a typed confirmation at a")
+    print("  terminal, or --yes-remove-secrets.")
+    print("Remove the local-development redirect " + LOCAL_REDIRECT + " from cloudshift operators.")
     print("Customer onboarding stays manual.")
 
 
@@ -732,12 +795,22 @@ def main():
                       help="Go back to the inventory client secret (rollback; needs GRAPH_CLIENT_SECRET)")
     parser.add_argument("--remove-secrets", action="store_true",
                         help="After a federated install works: delete the inventory app's old client secrets")
+    parser.add_argument("--yes-remove-secrets", action="store_true",
+                        help="With --remove-secrets: confirm without a terminal (scripts, pipelines)")
+    parser.add_argument("--all-credentials", action="store_true",
+                        help="With --remove-secrets: delete every inventory client secret, not only AIO's")
     args = parser.parse_args()
+    if (args.yes_remove_secrets or args.all_credentials) and not args.remove_secrets:
+        raise SetupError("--yes-remove-secrets and --all-credentials only apply with --remove-secrets.")
     if not NAME.fullmatch(args.name):
         raise SetupError("--name must be 3-24 lowercase letters, digits or hyphens, starting with a letter.")
     if args.plan:
         plan(args)
         return
+    if args.remove_secrets and not args.yes_remove_secrets and not sys.stdin.isatty():
+        # Refuse before changing Azure, instead of confirming silently at the end of the deploy.
+        raise SetupError("--remove-secrets needs a terminal to confirm. To run it without one, add "
+                         "--yes-remove-secrets; nothing was changed.")
     choice = True if args.federation else False if args.no_federation else None
     if args.remove_secrets and choice is False:
         raise SetupError("--remove-secrets needs workload identity federation; it cannot be used with --no-federation.")
@@ -843,8 +916,9 @@ def main():
         write_setting(args.env_file, FEDERATION, settings[FEDERATION])
     if args.remove_secrets:
         progress.step("Removing the inventory app's old client secrets (--remove-secrets)")
-        remove_inventory_secrets(settings["GRAPH_CLIENT_ID"], base["vaultName"], args.env_file)
-    progress.step("Adding the hosted sign-in address to cloudshift operators")
+        remove_inventory_secrets(settings["GRAPH_CLIENT_ID"], base["vaultName"], args.env_file,
+                                 all_credentials=args.all_credentials, assume_yes=args.yes_remove_secrets)
+    progress.step("Adding the hosted sign-in address to cloudshift operators (local redirect removed)")
     registration = cli(["ad", "app", "show", "--id", settings["ENTRA_CLIENT_ID"]])
     redirects = merged_redirects(registration.get("web", {}).get("redirectUris", []), app_url, public_url)
     cli(["ad", "app", "update", "--id", settings["ENTRA_CLIENT_ID"], "--web-redirect-uris", *redirects])

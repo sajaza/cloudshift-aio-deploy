@@ -28,6 +28,12 @@ OUTPUT_PATH = ROOT / ".env.entra.generated"
 OPERATOR_GROUP = "CLOUDSHIFT_OPERATOR_GROUP_ID"
 # Set by deploy-azure.py --federation: the hosted inventory app uses workload identity federation.
 FEDERATION = "CLOUDSHIFT_USE_FEDERATION"
+# Local-development sign-in redirect; left out with --for-hosting (deploy-azure.py adds the hosted one).
+LOCAL_REDIRECT = "http://localhost:3000/api/auth/callback/azure-ad"
+# Display name of the client secrets this script creates; deploy-azure.py --remove-secrets matches it.
+SECRET_NAME = "cloudshift local setup"
+# Secret values live only in the generated settings file once it is written; the state file keeps IDs.
+SECRET_SETTINGS = {"operators": "ENTRA_CLIENT_SECRET", "inventory": "GRAPH_CLIENT_SECRET"}
 
 
 class SetupError(Exception):
@@ -108,11 +114,11 @@ def resolve_permissions(roles):
     return result
 
 
-def manifests(role_ids):
+def manifests(role_ids, for_hosting=False):
     return {
         "operators": {
             "displayName": "cloudshift operators", "signInAudience": "AzureADMyOrg",
-            "web": {"redirectUris": ["http://localhost:3000/api/auth/callback/azure-ad"],
+            "web": {"redirectUris": [] if for_hosting else [LOCAL_REDIRECT],
                     "implicitGrantSettings": {"enableAccessTokenIssuance": False, "enableIdTokenIssuance": False}},
             "requiredResourceAccess": [],
         },
@@ -126,6 +132,32 @@ def manifests(role_ids):
 
 def save_state(state):
     private_write(STATE_PATH, json.dumps(state, indent=2) + "\n")
+
+
+def scrub_state(state):
+    """Keep app and secret key IDs only. Called once the settings file holds every secret value."""
+    state.pop("session_secret", None)
+    for record in state["apps"].values():
+        record.pop("secret", None)
+    save_state(state)
+
+
+def known_secrets(state, previous):
+    """Fill secret values a scrubbed state no longer holds from the existing settings file (in memory
+    only; never saved back to the state file)."""
+    def stored(key):
+        # quote() escaped "$" as "\$" for Next.js; undo it so the value is not escaped twice.
+        return env_value(previous, key).replace("\\$", "$")
+    if not state.get("session_secret"):
+        value = stored("NEXTAUTH_SECRET")
+        state["session_secret"] = value or secrets.token_urlsafe(48)
+        if not value:
+            print("No saved session secret: generated a new one (operators sign in again after the next deploy).")
+    for key, setting in SECRET_SETTINGS.items():
+        record = state["apps"].get(key)
+        value = stored(setting)
+        if record is not None and "secret" not in record and value:
+            record["secret"] = value
 
 
 def load_state(tenant_id, operator_id):
@@ -151,7 +183,7 @@ def load_state(tenant_id, operator_id):
     return state
 
 
-def provision_app(key, manifest, state):
+def provision_app(key, manifest, state, want_secret=True):
     apps = state["apps"]
     record = apps.get(key)
     if record:
@@ -168,10 +200,12 @@ def provision_app(key, manifest, state):
         graph("POST", "/servicePrincipals", {"appId": record["client_id"]})
     elif len(principals) != 1:
         raise SetupError("Ambiguous enterprise application lookup.")
-    if "secret" not in record:
+    if "secret" not in record and want_secret:
+        # Neither the state nor the settings file holds a value: add a new secret (an older one, if any,
+        # stays on the app until it expires or is deleted in the portal).
         expiry = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=180)).strftime("%Y-%m-%dT%H:%M:%SZ")
         credential = graph("POST", "/applications/" + record["object_id"] + "/addPassword",
-                           {"passwordCredential": {"displayName": "cloudshift local setup", "endDateTime": expiry}})
+                           {"passwordCredential": {"displayName": SECRET_NAME, "endDateTime": expiry}})
         if not credential.get("secretText"):
             raise SetupError("Entra did not return a new credential; refusing to print response details.")
         record.update(secret=credential["secretText"], secret_key_id=identifier(credential["keyId"]), expires=expiry)
@@ -233,7 +267,7 @@ def environment(state, tenant_name, operator_group="", federation=False, invento
         "NEXTAUTH_SECRET": state["session_secret"], "ENTRA_TENANT_ID": state["tenant_id"],
         "ENTRA_CLIENT_ID": a["client_id"], "ENTRA_CLIENT_SECRET": a["secret"],
         "CLOUDSHIFT_OPERATOR_IDS": state["operator_id"], "GRAPH_CLIENT_ID": b["client_id"],
-        "GRAPH_CLIENT_SECRET": b["secret"],
+        "GRAPH_CLIENT_SECRET": b.get("secret", ""),
         "CLOUDSHIFT_TENANTS_JSON": json.dumps([{"id": state["tenant_id"], "name": tenant_name}]),
         "CLOUDSHIFT_GDAP_DISCOVERY": "false", "CLOUDSHIFT_PARTNER_DISCOVERY": "false",
     }
@@ -268,13 +302,15 @@ def main():
         print(f"Operator group {group} saved to {args.env_file.name}; redeploy to apply it.")
         return
     if args.plan:
-        print("Create cloudshift operators: single-tenant OIDC web app, localhost redirect, no Graph permissions.")
+        print("Create cloudshift operators: single-tenant OIDC web app, no Graph permissions; localhost redirect")
+        print("  only for local use (--for-hosting adds none; the hosting step adds the HTTPS one).")
         print("Create cloudshift inventory: multitenant app, read-only Graph application permissions:")
         for permission in PERMISSIONS:
             print("  " + permission)
         print("Create enterprise apps and 180-day client secrets; approve only the signed-in operator locally.")
         print("With --operator-group, also let members of that Entra group sign in (saved as " + OPERATOR_GROUP + ").")
-        print("Store credentials in ignored mode-0600 files; preserve .env.local. Admin consent remains a portal step.")
+        print("Store credentials in the ignored mode-0600 settings file; the resume state file keeps IDs only.")
+        print("Preserve .env.local. Admin consent remains a portal step.")
         return
     if not args.tenant_id:
         raise SetupError("Pass --tenant-id with your Entra tenant UUID, or use --plan.")
@@ -291,16 +327,13 @@ def main():
     graph_principals = collection("servicePrincipals", "appId eq '" + GRAPH_APP_ID + "'", "id,appRoles")
     if len(graph_principals) != 1:
         raise SetupError("Microsoft Graph service principal not found uniquely.")
-    definitions = manifests(resolve_permissions(graph_principals[0].get("appRoles", [])))
+    definitions = manifests(resolve_permissions(graph_principals[0].get("appRoles", [])), args.for_hosting)
     # Preflight every unsaved display name before making any new registrations.
     state = load_state(tenant_id, operator_id)
     for key, definition in definitions.items():
         if key not in state["apps"] and collection("applications", "displayName eq '" + definition["displayName"] + "'", "id,appId"):
             raise SetupError("An existing '" + definition["displayName"] + "' registration was found without setup state. Reuse it manually; this script will not modify or delete it.")
-    for key, definition in definitions.items():
-        print("Preparing " + definition["displayName"] + "…")
-        provision_app(key, definition, state)
-    federation, inventory_secret = False, True
+    federation, inventory_secret, previous = False, True, []
     if OUTPUT_PATH.is_file() and not OUTPUT_PATH.is_symlink():
         previous = read_private_env(OUTPUT_PATH)
         # Keep an operator group saved by an earlier run or by --set-operator-group.
@@ -308,7 +341,13 @@ def main():
         # Keep a hosted install federated, and do not restore a client secret it already removed.
         federation = env_value(previous, FEDERATION) == "true"
         inventory_secret = bool(env_value(previous, "GRAPH_CLIENT_SECRET"))
+    known_secrets(state, previous)
+    for key, definition in definitions.items():
+        print("Preparing " + definition["displayName"] + "…")
+        provision_app(key, definition, state, want_secret=key != "inventory" or not federation or inventory_secret)
     private_write(OUTPUT_PATH, environment(state, args.tenant_name, operator_group, federation, inventory_secret))
+    # The settings file now holds every secret value; keep only IDs in the resume state.
+    scrub_state(state)
     if args.for_hosting:
         print("App registrations ready; private configuration saved for the hosting step.")
         return

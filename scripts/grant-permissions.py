@@ -5,6 +5,9 @@ Adds any missing read permission to cloudshift inventory, admin-consents exactly
 calls Microsoft Graph once per area as AIO does, then restarts the hosted app so it uses the new
 access. Never prints credential values. Python standard library only.
 Run --check-only to only test, without changing anything.
+An install using workload identity federation whose inventory client secret was removed cannot be tested
+from here (only the Container App's managed identity can sign in as cloudshift inventory); the script
+then requests, consents and restarts, and the areas are checked in AIO itself.
 """
 import argparse
 import importlib.util
@@ -179,7 +182,14 @@ def main():
     settings = deployment.load_settings(args.env_file)
     app_id = settings["GRAPH_CLIENT_ID"]
     names = deployment.READ_PERMISSIONS
-    progress = deployment.Progress(2 if args.check_only else 6)
+    # A federated install that ran --remove-secrets has no local inventory secret: only the Container
+    # App's managed identity can get its token, so the live check runs in AIO, not here.
+    testable = bool(settings.get("GRAPH_CLIENT_SECRET"))
+    if not testable and args.check_only:
+        raise SetupError("This install uses workload identity federation and the settings file holds no "
+                         "inventory client secret, so the check cannot run from here. Sign in to AIO and "
+                         "open each area instead; nothing was changed.")
+    progress = deployment.Progress((2 if args.check_only else 6) if testable else 4)
     changed = False
     if not args.check_only:
         if not shutil.which("az"):
@@ -203,12 +213,19 @@ def main():
                              "permissions → Grant admin consent.") from None
         print("  granted: " + ", ".join(granted) if granted else "  already granted")
         changed = bool(added or granted)
-    progress.step("Getting an app sign-in for cloudshift inventory")
-    app_token(settings)
-    print("  signed in")
-    progress.step("Testing each AIO area against Microsoft Graph", "under 1 min; up to 5 min after new consent")
-    # Only wait for propagation when this run changed access; otherwise a denial is the real answer.
-    results = run_checks(settings, WAIT_SECONDS if changed else 0)
+    results = []
+    if testable:
+        progress.step("Getting an app sign-in for cloudshift inventory")
+        app_token(settings)
+        print("  signed in")
+        progress.step("Testing each AIO area against Microsoft Graph",
+                      "under 1 min; up to 5 min after new consent")
+        # Only wait for propagation when this run changed access; otherwise a denial is the real answer.
+        results = run_checks(settings, WAIT_SECONDS if changed else 0)
+    elif changed:
+        # No local check to wait on: give new consent time to reach the app's next token before restarting.
+        print("  waiting 2 minutes for the new consent to apply before the restart", flush=True)
+        time.sleep(120)
     if not args.check_only:
         # After the checks, so the app's next Graph token is issued once the new access is in effect.
         progress.step("Restarting AIO so it drops its old Microsoft sign-in", "under 1 min")
@@ -220,6 +237,11 @@ def main():
               "restart it from Container App → Revisions → Restart if it runs elsewhere")
     progress.finish()
     print()
+    if not testable:
+        print("Skipped the live check: this install uses workload identity federation and the settings file")
+        print("holds no inventory client secret (the app signs in with its managed identity). Sign in to AIO")
+        print("and open each area to confirm; an area missing a licence shows as unavailable there.")
+        return
     width = max(len(label) for label, *_ in results)
     for label, permission, status, code in results:
         print(f"  {'✓' if status == 200 else '✗'} {label.ljust(width)}  {explain(permission, status, code)}")
